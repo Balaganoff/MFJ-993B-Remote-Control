@@ -1,0 +1,22 @@
+# Arduino build output
+build/
+.pio/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Arduino IDE / editor state
+.arduinoIDE/
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local credentials and backups
+secrets.h
+*.bak
+*.tmp
+*~
