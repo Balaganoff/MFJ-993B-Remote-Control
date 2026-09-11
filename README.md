@@ -55,6 +55,22 @@ The LCD lines enter the ESP32 through a 74LVC244A powered from 3.3 V. The eight 
 
 See [Hardware implementation](docs/hardware.md) for measured timing, signal direction, optocoupler and relay details.
 
+## Possible adaptation to MFJ-998 / MFJ-998B-labelled units
+
+The same **design approach** can be adapted to the MFJ-998 family, but the present hardware map and firmware are not a drop-in MFJ-998 build. The public MFJ documentation located for this comparison names the model **MFJ-998** (without the `B` suffix); any unit specifically labelled `MFJ-998B` must be checked against its own PCB revision and schematic.
+
+The published MFJ-998 Rev. 1A schematic shows a WH1602B 16×2 display connected to a PIC18F2520 through `RS`, `E` and `DB4…DB7`. This makes the passive LCD capture concept and a 5 V-tolerant 74LVC244A input stage applicable in principle.
+
+However, the following items must be measured and adapted separately:
+
+- LCD timing, idle levels, sampling delay and CGRAM behavior;
+- display layouts and parsing, especially four-digit legal-limit power values;
+- ESP32 GPIO assignment and every solder point;
+- eight-button MFJ-998 control layout: it has no separate AUTO button;
+- button polarity, optocoupler orientation, power switching and supported combinations.
+
+Do not use this repository's MFJ-993B wiring table or firmware unchanged on an MFJ-998-class tuner. The MFJ-998 is a legal-limit device; disconnect the amplifier, transmitter, antennas and power before any internal work.
+
 The capture loop runs on ESP32 core 1 at 240 MHz. It samples `GPIO_IN_REG` 110 CPU cycles after LCD `E` is observed high and combines two 4-bit transfers into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction and all eight custom characters.
 
 Networking and housekeeping run on core 0. The browser requests the next snapshot only after the previous response, so slow Wi-Fi or a VPN cannot build a queue of obsolete screens. Button commands are sent immediately.
@@ -176,6 +192,9 @@ The control page, Wi-Fi configuration form, WebSocket and firmware-update page d
 - [MFJ-993B product page](https://mfjenterprises.com/products/mfj-993b)
 - [MFJ-993B instruction manual, version 2B (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-993B.pdf?v=1586534115)
 - [MFJ-991B/993B/994B/995 Rev. 2 schematic (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-991B_993B_994B_Rev_2_Schematic.pdf?v=1586534155)
+- [MFJ-998 product page](https://mfjenterprises.com/products/mfj-998)
+- [MFJ-998 instruction manual, version 1G (PDF)](https://manuals.repeater-builder.com/MFJ/MFJ-998/MFJ-998.pdf)
+- [MFJ-998 Rev. 1A schematic (PDF)](https://w6iwi.org/az/MFJ998RT/mfj-998-schema.pdf)
 - [Hitachi HD44780U data sheet (archived PDF)](https://cdn.sparkfun.com/assets/9/5/f/7/b/HD44780.pdf)
 - [Texas Instruments SN74LVC244A data sheet](https://www.ti.com/lit/ds/symlink/sn74lvc244a.pdf)
 - [Sharp PC817XxNSZ1B data sheet](https://global.sharp/products/device/lineup/data/pdf/datasheet/PC817XxNSZ1B_e.pdf)
@@ -226,6 +245,22 @@ PIC16F76 соединён с совместимым с HD44780 дисплеем 
 Шесть сигналов LCD проходят через 74LVC244A с питанием 3,3 В. В обратном направлении восемь выходов ESP32 включают PC817, распаянные параллельно штатным кнопкам. Девятая PC817 управляет отдельным драйвером реле питания. Поэтому веб-интерфейс может нажимать обычные кнопки, удерживать их и выполнять комбинации настроек, тестов и сброса.
 
 Полное описание измерений и электрической части: [docs/hardware.md](docs/hardware.md).
+
+## Возможность адаптации к MFJ-998 / устройствам с маркировкой MFJ-998B
+
+К MFJ-998 можно применить **общий принцип** этого проекта, но не готовую прошивку и не текущую распиновку целиком. В найденных открытых материалах MFJ модель обозначена как **MFJ-998** без суффикса `B`. Если на конкретном устройстве указано `MFJ-998B`, сначала необходимо найти или снять схему именно его ревизии платы.
+
+На опубликованной схеме MFJ-998 Rev. 1A дисплей WH1602B подключён к PIC18F2520 по тем же линиям `RS`, `E`, `DB4…DB7`. Поэтому пассивное считывание LCD через 5-вольт-совместимый входной буфер 74LVC244A технически применимо.
+
+Но отдельно потребуется проверить и изменить:
+
+- времена сигналов, уровни в паузе, задержку выборки и работу CGRAM;
+- разметку экранов и парсер — в MFJ-998 встречаются четырёхзначные значения мощности;
+- все GPIO ESP32 и физические точки пайки;
+- управление восемью кнопками MFJ-998, у которого нет отдельной кнопки AUTO;
+- полярность кнопочных цепей, ориентацию PC817, включение питания и сочетания кнопок.
+
+Подключать эту сборку к MFJ-998 без измерений и доработки исходника нельзя. Поскольку это тюнер предельной мощности, перед вскрытием необходимо отключить усилитель, трансивер, антенны и питание.
 
 ## Быстрый запуск
 

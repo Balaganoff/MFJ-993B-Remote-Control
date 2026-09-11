@@ -16,6 +16,7 @@
 - Added interface screenshots for the main meter, manual L/C screen, button combinations, firmware update and Wi-Fi recovery setup.
 - Added the measured PIC-to-LCD bus behavior, 74LVC244A input stage, PC817 button interfaces and power-relay wiring diagram.
 - Added a dedicated Wi-Fi fallback and recovery guide matching the actual configuration page.
+- Added a scoped MFJ-998 adaptation note: the LCD-capture approach is reusable, but wiring, controls, timing and firmware require model-specific verification and changes.
 
 ## 2026-09-09
 
