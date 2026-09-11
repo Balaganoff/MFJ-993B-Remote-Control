@@ -21,15 +21,39 @@ The ESP32 passively observes the tuner's 4-bit LCD bus, reconstructs the visible
 - Browser polling every 20 ms normally and every 100 ms while a momentary control is held.
 - Firmware upload from the browser at `/update` using the main `*.ino.bin` file.
 
+## Screenshots / Скриншоты
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/web-main-meter.png" alt="Main frequency, SWR, FWD and REF screen" width="360"><br><b>Main meter / Основной экран</b></td>
+    <td align="center"><img src="docs/images/web-manual-lc.png" alt="Manual inductance and capacitance adjustment screen" width="360"><br><b>Manual L/C / Ручная подстройка</b></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/web-extra-combinations.png" alt="Additional operating and power-on button combinations" width="360"><br><b>Button combinations / Комбинации кнопок</b></td>
+    <td align="center"><img src="docs/images/web-firmware-update.png" alt="Browser firmware update page" width="400"><br><b>Firmware update / Обновление прошивки</b></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/images/wifi-setup.svg" alt="Wi-Fi setup page used in configuration access-point mode" width="650"><br><b>Wi-Fi recovery setup / Настройка Wi-Fi</b></td>
+  </tr>
+</table>
+
 ## Architecture
 
 ```mermaid
 flowchart LR
-    LCD["MFJ LCD bus<br>RS, E, DB4-DB7"] --> LEVEL["5 V to 3.3 V<br>input interface"] --> ESP["ESP32<br>LCD decoder"]
+    LCD["MFJ LCD bus<br>RS, E, DB4-DB7"] --> LEVEL["74LVC244A<br>5 V to 3.3 V"] --> ESP["ESP32<br>LCD decoder"]
     ESP --> WEB["HTTP + WebSocket"] --> UI["Phone or PC browser"]
     UI --> ESP
-    ESP --> DRIVER["Isolated/open-collector<br>switch drivers"] --> PANEL["MFJ control lines"]
+    ESP --> DRIVER["PC817 channels<br>buttons + relay"] --> PANEL["MFJ controls<br>and power"]
 ```
+
+On the tested tuner the PIC16F76 drives the HD44780-compatible LCD in short 4-bit bursts rather than continuously retransmitting the full screen. In the idle state `E` is low while `RS` and `DB4…DB7` are high. The measured `E` high plateau is about 520 ns; the remaining bus lines are stable for about 1–2 µs, with brief 10–20 ns transition ringing up to approximately 0.5 V. These are measurements from the reference unit, not universal HD44780 idle requirements.
+
+The LCD lines enter the ESP32 through a 74LVC244A powered from 3.3 V. The eight normal front-panel controls are reproduced by PC817 optocouplers wired in parallel with the physical buttons. A ninth isolated channel controls the external power-relay driver, which makes the documented service and reset combinations possible without disabling the original controls.
+
+![Reference hardware wiring](docs/images/hardware-wiring.svg)
+
+See [Hardware implementation](docs/hardware.md) for measured timing, signal direction, optocoupler and relay details.
 
 The capture loop runs on ESP32 core 1 at 240 MHz. It samples `GPIO_IN_REG` 110 CPU cycles after LCD `E` is observed high and combines two 4-bit transfers into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction and all eight custom characters.
 
@@ -43,9 +67,12 @@ The browser applies layout normalization only to the recognized `FWD=/REF=` mete
 firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino  Main firmware
 tools/LCD1602_CGRAM_Terminal_110/                           Serial diagnostic firmware
 docs/wiring.md                                             Wiring and electrical safety
+docs/hardware.md                                           Measured bus behavior and interface circuit
 docs/controls.md                                           Buttons and combinations
 docs/protocol.md                                           LCD capture and WebSocket protocol
 docs/firmware-update.md                                    Browser firmware-update procedure
+docs/wifi-setup.md                                         Wi-Fi fallback and recovery procedure
+docs/images/                                               Interface screenshots and wiring diagram
 CHANGELOG.md                                                Notable firmware changes
 platformio.ini                                             Reproducible PlatformIO build
 .github/workflows/build.yml                                Automatic build check
@@ -83,9 +110,9 @@ See [Wiring](docs/wiring.md) before making any connection.
 
 ## Electrical and RF safety
 
-**Do not connect a 5 V LCD signal directly to an ESP32 GPIO.** Use a suitable 5 V-to-3.3 V level translator or calculated resistor dividers on RS, E and DB4-DB7.
+**Do not connect a 5 V LCD signal directly to an ESP32 GPIO.** The reference build uses a 74LVC244A powered from 3.3 V on RS, E and DB4-DB7. Both active-low output-enable inputs are held low and a 100 nF bypass capacitor is placed close to the IC.
 
-Do not connect push-pull ESP32 outputs directly to the tuner's switch nets. Use an appropriate optocoupler, transistor/open-collector, analog-switch or relay interface that behaves like the original contact and does not feed voltage back into either device.
+Do not connect push-pull ESP32 outputs directly to the tuner's switch nets. The reference build uses one PC817 channel per physical button and another isolated channel feeding a proper power-relay driver. A PC817 must not drive a conventional relay coil directly.
 
 Disconnect the transmitter, antennas and DC power before opening the tuner. Never work inside it while transmitting. Follow all warnings and service conditions in the MFJ manual.
 
@@ -115,6 +142,8 @@ The current firmware does **not** require an Arduino IDE network port, mDNS, UDP
 6. Reload the main page with `Ctrl+F5` if the browser retained an older embedded page.
 
 The same HTTP method works through a routed VPN when the ESP32 address and TCP port 80 are reachable. Detailed instructions and file locations are in [Firmware update](docs/firmware-update.md).
+
+Wi-Fi fallback access-point behavior is documented in [Wi-Fi setup and recovery](docs/wifi-setup.md).
 
 ## PlatformIO
 
@@ -147,6 +176,10 @@ The control page, Wi-Fi configuration form, WebSocket and firmware-update page d
 - [MFJ-993B product page](https://mfjenterprises.com/products/mfj-993b)
 - [MFJ-993B instruction manual, version 2B (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-993B.pdf?v=1586534115)
 - [MFJ-991B/993B/994B/995 Rev. 2 schematic (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-991B_993B_994B_Rev_2_Schematic.pdf?v=1586534155)
+- [Hitachi HD44780U data sheet (archived PDF)](https://cdn.sparkfun.com/assets/9/5/f/7/b/HD44780.pdf)
+- [Texas Instruments SN74LVC244A data sheet](https://www.ti.com/lit/ds/symlink/sn74lvc244a.pdf)
+- [Sharp PC817XxNSZ1B data sheet](https://global.sharp/products/device/lineup/data/pdf/datasheet/PC817XxNSZ1B_e.pdf)
+- [Espressif ESP32 Series data sheet](https://www.espressif.com/sites/default/files/documentation/esp32_datasheet_en.pdf)
 - [Arduino core for ESP32 documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/)
 - [Espressif browser OTA update guide](https://docs.espressif.com/projects/arduino-esp32/en/latest/ota_web_update.html)
 - [ESP32Async/ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
@@ -184,6 +217,16 @@ ESP32 пассивно считывает шину дисплея, восста�
 - Опрос каждые 20 мс, при удержании кнопки — каждые 100 мс.
 - Загрузка основной прошивки `.ino.bin` прямо из браузера через `/update`.
 
+## Как устроено
+
+PIC16F76 соединён с совместимым с HD44780 дисплеем LCD1602 по 4-битной шине `RS`, `E`, `DB4…DB7`. На проверенном тюнере в паузе `E` имеет низкий уровень, остальные наблюдаемые линии — высокий. PIC передаёт команды и изменившиеся данные короткими пакетами, а не повторяет весь экран постоянно: состояние DDRAM и CGRAM хранится самим контроллером LCD.
+
+Измеренная длительность высокого уровня `E` — около 520 нс. Остальные линии устойчивы примерно 1–2 мкс; короткий переходный звон до 0,5 В длится лишь 10–20 нс. По протоколу LCD фиксирует записываемые данные по спаду `E`, а ESP32 делает одну одновременную выборку линий после задержки `110` тактов CPU.
+
+Шесть сигналов LCD проходят через 74LVC244A с питанием 3,3 В. В обратном направлении восемь выходов ESP32 включают PC817, распаянные параллельно штатным кнопкам. Девятая PC817 управляет отдельным драйвером реле питания. Поэтому веб-интерфейс может нажимать обычные кнопки, удерживать их и выполнять комбинации настроек, тестов и сброса.
+
+Полное описание измерений и электрической части: [docs/hardware.md](docs/hardware.md).
+
 ## Быстрый запуск
 
 1. Установите [Arduino IDE](https://www.arduino.cc/en/software).
@@ -208,10 +251,12 @@ ESP32 пассивно считывает шину дисплея, восста�
 
 ## Документация
 
+- [Аппаратная реализация, измерения и схема](docs/hardware.md)
 - [Подключение и безопасность](docs/wiring.md)
 - [Кнопки и сочетания](docs/controls.md)
 - [Захват LCD и протокол WebSocket](docs/protocol.md)
 - [Обновление прошивки через браузер](docs/firmware-update.md)
+- [Настройка и восстановление Wi-Fi](docs/wifi-setup.md)
 
 Диагностический скетч `tools/LCD1602_CGRAM_Terminal_110/LCD1602_CGRAM_Terminal_110.ino` является отдельной тестовой прошивкой без основного веб-пульта.
 

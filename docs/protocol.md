@@ -2,6 +2,12 @@
 
 This document describes the current firmware, including the fixed main meter layout and browser-based firmware upload.
 
+The browser normally renders the captured LCD directly. Only the recognized main meter screen receives fixed-cell normalization; the manual L/C screen and other modes remain literal LCD copies.
+
+| Main meter | Manual L/C screen |
+|---|---|
+| ![Main meter screen](images/web-main-meter.png) | ![Manual L/C screen](images/web-manual-lc.png) |
+
 ## LCD capture
 
 The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency.

@@ -4,6 +4,8 @@ The current firmware receives its next application image over ordinary HTTP. Ard
 
 Текущая прошивка принимает новый образ через обычный HTTP. Поиск сетевого порта в Arduino IDE и порт 3232 не используются.
 
+![Browser firmware-update page](images/web-firmware-update.png)
+
 ## Requirements / Что требуется
 
 - The ESP32 must already run a version containing the `/update` page.

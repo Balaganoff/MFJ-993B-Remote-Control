@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="600" viewBox="0 0 860 600" role="img" aria-labelledby="title desc">
+  <title id="title">MFJ-993B Wi-Fi configuration page</title>
+  <desc id="desc">Browser view of the Wi-Fi configuration form shown when the saved network is unavailable.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+    <linearGradient id="button" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#087a4d"/>
+      <stop offset="1" stop-color="#05613d"/>
+    </linearGradient>
+  </defs>
+  <rect width="860" height="600" fill="#0d0f0e"/>
+  <rect x="70" y="45" width="720" height="510" rx="18" fill="#171918" stroke="#3d423f" stroke-width="2" filter="url(#shadow)"/>
+  <circle cx="100" cy="76" r="7" fill="#ff5f57"/>
+  <circle cx="124" cy="76" r="7" fill="#febc2e"/>
+  <circle cx="148" cy="76" r="7" fill="#28c840"/>
+  <rect x="183" y="62" width="557" height="28" rx="14" fill="#242725"/>
+  <text x="205" y="81" fill="#aab1ad" font-family="Arial, sans-serif" font-size="15">http://192.168.4.1/</text>
+
+  <text x="430" y="162" text-anchor="middle" fill="#24f06d" font-family="Arial, sans-serif" font-size="31" font-weight="700">MFJ-993B WiFi Config</text>
+  <text x="430" y="199" text-anchor="middle" fill="#a7ada9" font-family="Arial, sans-serif" font-size="17">Подключитесь к точке доступа и сохраните параметры домашней сети</text>
+
+  <rect x="235" y="235" width="390" height="58" rx="5" fill="#222524" stroke="#5a605c" stroke-width="2"/>
+  <text x="258" y="270" fill="#c7ccca" font-family="Arial, sans-serif" font-size="18">WiFi Name (SSID)</text>
+  <rect x="235" y="313" width="390" height="58" rx="5" fill="#222524" stroke="#5a605c" stroke-width="2"/>
+  <text x="258" y="348" fill="#c7ccca" font-family="Arial, sans-serif" font-size="18">Password</text>
+  <rect x="292" y="400" width="276" height="58" rx="7" fill="url(#button)"/>
+  <text x="430" y="436" text-anchor="middle" fill="#fff" font-family="Arial, sans-serif" font-size="17" font-weight="700">SAVE AND REBOOT</text>
+
+  <text x="430" y="500" text-anchor="middle" fill="#76d9ad" font-family="monospace" font-size="16">AP: MFJ993b-CONFIG</text>
+  <text x="430" y="526" text-anchor="middle" fill="#9aa19d" font-family="monospace" font-size="15">пароль по умолчанию: 12345678</text>
+</svg>

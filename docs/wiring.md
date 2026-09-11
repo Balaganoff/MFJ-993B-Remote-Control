@@ -1,8 +1,12 @@
 # Wiring / Подключение
 
-This document records the pin assignment used by the current firmware. It is not a universal MFJ-993B modification guide: board revisions and individual interface circuits may differ.
+This document records the pin assignment used by the current firmware. The working reference installation uses a 74LVC244A for LCD level translation, eight PC817 channels in parallel with the physical buttons, and a ninth isolated channel for the power-relay driver. It is not a universal MFJ-993B modification guide: board revisions and individual interface circuits may differ.
 
-Здесь зафиксирована распиновка текущей прошивки. Это не универсальная инструкция по доработке MFJ-993B: ревизии плат и схемы развязки могут отличаться.
+Здесь зафиксирована распиновка текущей прошивки. В проверенной сборке шина LCD поступает через 74LVC244A, восемь PC817 подключены параллельно физическим кнопкам, а девятая оптопара управляет драйвером реле питания. Это не универсальная инструкция по доработке MFJ-993B: ревизии плат и схемы развязки могут отличаться.
+
+![Complete reference wiring](images/hardware-wiring.svg)
+
+Measurements, interface behavior and component-level notes are documented in [Hardware implementation](hardware.md).
 
 ## LCD bus inputs / Входы шины LCD
 
@@ -18,9 +22,9 @@ The MFJ schematic identifies the display as a WH1602B-compatible 16x2 module usi
 | DB7 | 14 | 23 | INPUT | Data bit 3 of each nibble |
 | GND/VSS | 1 | GND | — | Common reference, according to interface design |
 
-DB0-DB3 are not used. The ESP32 does not drive the LCD and must only observe these lines through a 5 V to 3.3 V input interface.
+DB0-DB3 are not used. The ESP32 does not drive the LCD. In the reference build the six observed lines pass through a 74LVC244A powered from 3.3 V; both `/OE` inputs are held low and a 100 nF bypass capacitor is fitted close to the IC.
 
-DB0-DB3 не используются. ESP32 не управляет дисплеем, а только наблюдает эти линии через согласование уровней 5 В → 3,3 В.
+DB0-DB3 не используются. ESP32 не управляет дисплеем. В проверенной сборке шесть линий проходят через 74LVC244A с питанием 3,3 В; оба входа `/OE` подключены к GND, возле микросхемы установлен блокировочный конденсатор 100 нФ.
 
 Линия R/W прошивкой не считывается. Декодер считает каждый перехваченный обмен записью и использует только RS, E и DB4-DB7.
 
@@ -44,26 +48,31 @@ These are levels expected by the author's external switch-driver stage, not perm
 
 Это уровни, рассчитанные на внешний каскад имитации контактов в авторской сборке. Они не означают, что GPIO можно напрямую соединять с цепями MFJ. Полярность каждого ключа необходимо проверить мультиметром до подключения тюнера.
 
-## Recommended signal path / Рекомендуемая структура
+## Reference signal path / Проверенная структура
 
-```mermaid
-flowchart LR
-    MFJLCD["MFJ LCD<br>5 V logic"] --> LEVEL["Level shifter or<br>resistor dividers"] --> ESPIN["ESP32 inputs"]
-    ESPOUT["ESP32 outputs"] --> DRIVER["Optocoupler / transistor /<br>analog switch / relay"] --> CONTACT["MFJ switch contacts"]
-```
+The display path and the remote-control path are separate:
+
+- `PIC16F76 → LCD1602 bus → 74LVC244A → ESP32 inputs`;
+- `browser → ESP32 outputs → PC817 → physical button contacts`;
+- `GPIO32 → PC817 → relay driver → power relay`.
+
+The 74LVC244A is one-way; the ESP32 never sends data back to the LCD. Remote feedback is implemented through the isolated button and relay channels.
 
 ### LCD side
 
-- Use a translator explicitly rated for 5 V input with a 3.3 V powered output, or calculate resistor dividers for all six LCD signals.
+- Use the exact 74LVC244A or another translator explicitly rated for 5 V input with a 3.3 V powered output.
 - Keep wires short. The firmware samples a fast digital bus and long unshielded leads may introduce ringing or timing errors.
-- Connect grounds only as required by the chosen level-shifting/isolation circuit.
+- Do not leave unused buffer inputs floating.
+- Use a common reference ground for LCD, 74LVC244A and ESP32 on the sensing path.
 
 ### Button side
 
-- Prefer galvanically isolated or open-collector contact emulation.
-- Do not inject 3.3 V into a tuner net and do not allow its 5 V pull-ups to reach the ESP32.
-- Preserve the original front-panel buttons; the remote circuit should be electrically parallel to the intended contacts.
-- Check ANT/AUTO latching behavior and POWER polarity before attaching the ESP32.
+- Connect each PC817 phototransistor electrically in parallel with the intended physical button, with collector/emitter orientation verified on the actual tuner board.
+- Give every PC817 LED its own calculated series resistor; 330–470 Ω at 3.3 V is only a starting range.
+- Do not inject 3.3 V into a tuner net and do not allow its pull-ups to reach the ESP32.
+- Preserve the original front-panel buttons.
+- Drive a conventional power-relay coil through a suitable transistor/MOSFET stage with a flyback diode, not directly from PC817.
+- Check ANT/AUTO latching behavior and the active-low POWER output before attaching the tuner.
 
 ## Power supply / Питание
 

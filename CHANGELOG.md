@@ -13,6 +13,9 @@
 - Changed normal browser polling from 25 ms to 20 ms; held-button polling remains 100 ms.
 - Updated README, protocol, wiring, controls and firmware-update documentation.
 - GitHub Actions now publishes a correctly named `.ino.bin` browser-update artifact after a successful build.
+- Added interface screenshots for the main meter, manual L/C screen, button combinations, firmware update and Wi-Fi recovery setup.
+- Added the measured PIC-to-LCD bus behavior, 74LVC244A input stage, PC817 button interfaces and power-relay wiring diagram.
+- Added a dedicated Wi-Fi fallback and recovery guide matching the actual configuration page.
 
 ## 2026-09-09
 
