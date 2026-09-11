@@ -4,6 +4,14 @@ The web page mirrors the nine physical controls. ANT, AUTO, and POWER are softwa
 
 Веб-страница повторяет девять органов управления. ANT, AUTO и POWER фиксируются программно. C-UP, L-UP, MODE, C-DN, L-DN и TUNE остаются нажатыми всё время удержания мыши или пальца.
 
+Button state packets are sent immediately. LCD requests continue every 100 ms during a hold so changing values and entry into Setup remain visible; the button command itself does not wait for an LCD frame.
+
+Команда кнопки отправляется сразу. Во время удержания LCD продолжает опрашиваться раз в 100 мс, поэтому изменение параметров и вход в Setup остаются видны.
+
+> A newly opened browser page starts with ANT1, AUTO and POWER ON selected and sends that state to the ESP32. Latched ANT/AUTO state is not read back from the tuner or stored between browser sessions.
+
+> После открытия страницы начальное состояние интерфейса — ANT1, AUTO и POWER ON. Положение ANT/AUTO не считывается обратно из тюнера и не сохраняется между сеансами браузера.
+
 ## MODE and TUNE timing / Временные функции MODE и TUNE
 
 According to the MFJ manual:

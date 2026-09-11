@@ -6,7 +6,7 @@ This document records the pin assignment used by the current firmware. It is not
 
 ## LCD bus inputs / Входы шины LCD
 
-The MFJ schematic identifies the display as a WH1602B-compatible 16x2 module using a 4-bit HD44780-style interface. R/W is controlled by the tuner and is not connected to the ESP32 firmware.
+The MFJ schematic identifies the display as a WH1602B-compatible 16x2 module using a 4-bit HD44780-style interface. The firmware does not sample R/W and assumes every captured transfer is a write; connect only RS, E and DB4-DB7 to the ESP32 input interface.
 
 | LCD signal | LCD module pin | ESP32 GPIO | ESP32 mode | Notes |
 |---|---:|---:|---|---|
@@ -21,6 +21,8 @@ The MFJ schematic identifies the display as a WH1602B-compatible 16x2 module usi
 DB0-DB3 are not used. The ESP32 does not drive the LCD and must only observe these lines through a 5 V to 3.3 V input interface.
 
 DB0-DB3 не используются. ESP32 не управляет дисплеем, а только наблюдает эти линии через согласование уровней 5 В → 3,3 В.
+
+Линия R/W прошивкой не считывается. Декодер считает каждый перехваченный обмен записью и использует только RS, E и DB4-DB7.
 
 ## Control outputs / Выходы кнопок
 

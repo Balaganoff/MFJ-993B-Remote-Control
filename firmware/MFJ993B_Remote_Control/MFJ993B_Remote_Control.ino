@@ -2,7 +2,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
-#include <ArduinoOTA.h>
+#include <Update.h>
 #include "soc/gpio_reg.h"
 
 // ============================================================================
@@ -37,6 +37,7 @@ const uint32_t MASK_LCD_BUS =
 const uint32_t SAMPLE_DELAY = 110;
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
+const uint32_t DISPLAY_IDLE_US = 12000;
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
@@ -52,15 +53,19 @@ const uint16_t INITIAL_BUTTON_MASK =
     (1U << 8);  // POWER ON
 
 // ============================================================================
-// WEB / WIFI / OTA
+// WEB / WIFI / ОБНОВЛЕНИЕ ПРОШИВКИ
 // ============================================================================
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Preferences prefs;
 
-volatile bool otaMode = false;
-bool otaStarted = false;
+volatile bool webUpdateInProgress = false;
+volatile bool webUpdateFailed = false;
+volatile bool webUpdateSucceeded = false;
+volatile bool webUpdateRestartPending = false;
+volatile uint32_t webUpdateRestartAtMs = 0;
+volatile uint32_t webUpdateLastActivityMs = 0;
 
 volatile uint16_t buttonMask = INITIAL_BUTTON_MASK;
 
@@ -86,6 +91,9 @@ volatile bool entryIncrement = true;
 portMUX_TYPE lcdMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile uint8_t lcdVersion = 0;
+// Время последнего реального изменения текстового экрана (DDRAM).
+// Динамическая CGRAM обновляется отдельно и не должна задерживать цифры.
+volatile uint32_t lastDdramChangeUs = 0;
 
 // Одна команда 0x40...0x7F ещё не доказывает запись CGRAM: на общей
 // шине возможен ошибочно собранный байт. Принимаем пиксели только сразу
@@ -278,7 +286,7 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     width: 80px;
     margin: 12px 6px 0;
   }
-  #otaButton {
+  #updateButton {
     margin-top: 22px;
     color: #555;
     font-size: 9px;
@@ -370,11 +378,11 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     <button onclick="confirmPower(false)">НЕТ</button>
   </div>
 
-  <div id="otaButton" onclick="startOta()">System Update (OTA)</div>
+  <div id="updateButton" onclick="location.href='/update'">Firmware Update (.bin)</div>
 
 <script>
+  const PACKET_LCD_WAIT = 0xFC;
   const PACKET_LCD = 0xFD;
-  const PACKET_OTA = 0xFE;
 
   let socket = null;
   let reconnectTimer = null;
@@ -387,21 +395,22 @@ const char indexHtml[] PROGMEM = R"rawliteral(
   let lastCellSignatures = Array(32).fill('');
   let specialSequenceRunning = false;
   let displayedMainKind = null;
-  let pendingUnanchoredValid = false;
-  let pendingUnanchoredVersion = -1;
+  let pendingRawSignature = '';
+  let meterGlyphSignature = '';
+  let pendingMeterGlyphSignature = '';
+  let pendingMeterGlyphCount = 0;
 
   const SPACE = 0x20;
   const MOMENTARY_MASK =
     (1 << 1) | (1 << 2) | (1 << 4) |
     (1 << 5) | (1 << 6) | (1 << 7);
-  const LCD_POLL_IDLE_MS = 25;
+  const LCD_POLL_IDLE_MS = 20;
   const LCD_POLL_HELD_MS = 100;
-  const trustedScreen = new Uint8Array(32);
-  const trustedCgram = new Uint8Array(64);
+  const LCD_BUSY_RETRY_MS = 12;
   const blankCgram = new Uint8Array(64);
-  const pendingUnanchoredScreen = new Uint8Array(32);
-  const pendingUnanchoredCgram = new Uint8Array(64);
-  trustedScreen.fill(SPACE);
+  const meterScreen = new Uint8Array(32);
+  const meterCgram = new Uint8Array(64);
+  meterScreen.fill(SPACE);
 
   const rows = [
     document.getElementById('row1'),
@@ -417,8 +426,10 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     text.className = 'lcd-char';
     text.textContent = '\u00A0';
     glyph.className = 'lcd-glyph';
-    glyph.width = 15;
-    glyph.height = 24;
+    // Рисуем в двойном разрешении и уменьшаем средствами браузера.
+    // Так точки CGRAM выглядят мягче и ближе к свечению настоящего LCD.
+    glyph.width = 30;
+    glyph.height = 48;
 
     cell.appendChild(text);
     cell.appendChild(glyph);
@@ -473,10 +484,10 @@ const char indexHtml[] PROGMEM = R"rawliteral(
       const canvas = cell.querySelector('.lcd-glyph');
       const context = canvas.getContext('2d');
 
-      context.clearRect(0, 0, 15, 24);
+      context.clearRect(0, 0, 30, 48);
       context.fillStyle = '#4e4';
       context.shadowColor = '#0f0';
-      context.shadowBlur = 1.2;
+      context.shadowBlur = 2.2;
 
       for (let row = 0; row < 8; row++) {
         const pixels = forceFullCell
@@ -486,10 +497,10 @@ const char indexHtml[] PROGMEM = R"rawliteral(
         for (let column = 0; column < 5; column++) {
           if (pixels & (1 << (4 - column))) {
             context.fillRect(
-              column * 3 + 0.35,
-              row * 3 + 0.35,
-              2.3,
-              2.3
+              column * 6 + 0.8,
+              row * 6 + 0.8,
+              4.4,
+              4.4
             );
           }
         }
@@ -518,11 +529,23 @@ const char indexHtml[] PROGMEM = R"rawliteral(
   }
 
   function matchesAscii(screen, offset, text) {
+    if (offset < 0 || offset + text.length > screen.length) return false;
+
     for (let i = 0; i < text.length; i++) {
       if (screen[offset + i] !== text.charCodeAt(i)) return false;
     }
 
     return true;
+  }
+
+  function findAscii(screen, start, end, text) {
+    const last = Math.min(end, screen.length) - text.length;
+
+    for (let offset = start; offset <= last; offset++) {
+      if (matchesAscii(screen, offset, text)) return offset;
+    }
+
+    return -1;
   }
 
   function writeAscii(screen, offset, text) {
@@ -531,66 +554,214 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     }
   }
 
-  function sameBytes(left, right) {
-    if (left.length !== right.length) return false;
+  function bytesToAscii(screen, start, end) {
+    let text = '';
 
-    for (let i = 0; i < left.length; i++) {
-      if (left[i] !== right[i]) return false;
+    for (let i = start; i < end; i++) {
+      const value = screen[i];
+      text += value >= 0x20 && value <= 0x7E
+        ? String.fromCharCode(value)
+        : '\x01';
     }
 
-    return true;
+    return text;
+  }
+
+  function setMeterField(offset, length, value) {
+    if (!value) return;
+
+    const normalized = value.padStart(length, ' ').slice(-length);
+
+    for (let i = 0; i < length; i++) {
+      meterScreen[offset + i] = normalized.charCodeAt(i);
+    }
+  }
+
+  function numericTokens(screen, start, end) {
+    const text = bytesToAscii(screen, start, end);
+    const result = [];
+    const expression = /[0-9][.,\/][0-9]|[0-9]{1,3}/g;
+    let match;
+
+    while ((match = expression.exec(text)) !== null) {
+      result.push({
+        value: match[0],
+        offset: start + match.index
+      });
+    }
+
+    return result;
+  }
+
+  function extractFrequency(screen) {
+    const row = bytesToAscii(screen, 0, 16);
+    const mhz = findAscii(screen, 0, 16, 'MHz');
+
+    if (mhz >= 0) {
+      const before = row.slice(Math.max(0, mhz - 6), mhz);
+      const match = before.match(/[ 0-9]{1,2}[.,][0-9]{3}$/);
+      if (match) return match[0].padStart(6, ' ').slice(-6);
+    }
+
+    const candidates = row.match(/[ 0-9]{1,2}[.,][0-9]{3}/g);
+    if (!candidates || candidates.length === 0) return null;
+
+    return candidates[0].padStart(6, ' ').slice(-6);
+  }
+
+  function extractValueAfter(screen, anchorOffset) {
+    if (anchorOffset < 0 || anchorOffset + 7 > screen.length) return null;
+
+    const value = bytesToAscii(
+      screen,
+      anchorOffset + 4,
+      anchorOffset + 7
+    );
+
+    return /^(?:[0-9][.,\/][0-9]|[ 0-9]{3})$/.test(value) &&
+      /[0-9]/.test(value)
+        ? value
+        : null;
+  }
+
+  function countBarCells(screen) {
+    let count = 0;
+
+    for (let i = 16; i < 29; i++) {
+      if (screen[i] <= 0x07 || screen[i] === 0x3D) count++;
+    }
+
+    return count;
   }
 
   function detectMainKind(screen) {
-    let meterAnchors = 0;
+    const mhz = findAscii(screen, 0, 16, 'MHz');
+    const fwd = findAscii(screen, 16, 32, 'FWD=');
+    const ref = findAscii(screen, 16, 32, 'REF=');
+    const row2Values = numericTokens(screen, 16, 32);
+    const barCells = countBarCells(screen);
 
-    if (matchesAscii(screen, 6, 'MHz')) meterAnchors++;
-    if (matchesAscii(screen, 16, 'FWD=')) meterAnchors++;
-    if (matchesAscii(screen, 25, 'REF=')) meterAnchors++;
-
-    // Двух независимых совпадений достаточно: третью постоянную надпись
-    // можно безопасно восстановить, не трогая показания и спецсимволы.
-    if (meterAnchors >= 2) return 'meter';
-
-    if (matchesAscii(screen, 6, 'MHz')) {
-      for (let i = 16; i < 29; i++) {
-        // Пробегающие шкалы состоят из '=' и CGRAM-кодов. Их выводим
-        // немедленно, а не ждём неподвижного кадра.
-        if (screen[i] === 0x3D || screen[i] <= 0x07) {
-          return 'bar';
-        }
-      }
-    }
+    if (mhz >= 0 && barCells >= 4) return 'bar';
 
     if (
-      screen[7] === 0xE4 &&
-      screen[8] === 0x48 &&
-      matchesAscii(screen, 26, 'pF')
+      (fwd >= 0 && ref >= 0) ||
+      (
+        mhz >= 0 &&
+        (fwd >= 0 || ref >= 0 || row2Values.length >= 2)
+      )
     ) {
-      return 'lc';
+      return 'meter';
+    }
+
+    // Один повреждённый якорь не должен выталкивать уже распознанный
+    // основной экран из его фиксированной раскладки.
+    if (
+      displayedMainKind === 'meter' &&
+      (mhz >= 0 || fwd >= 0 || ref >= 0)
+    ) {
+      return 'meter';
     }
 
     return null;
   }
 
-  function applySnapshot(screen, cgram, mainKind) {
-    trustedScreen.set(screen);
-    trustedCgram.set(cgram);
+  function getMeterGlyphSignature(cgram) {
+    let signature = '';
 
-    // Якоря исправляют только неизменные подписи основного экрана.
-    // Цифры, запятые, слеши, CGRAM и все Setup-экраны не изменяются.
-    if (mainKind === 'meter') {
-      writeAscii(trustedScreen, 6, 'MHz');
-      writeAscii(trustedScreen, 16, 'FWD=');
-      writeAscii(trustedScreen, 25, 'REF=');
-    }
-    else if (mainKind === 'lc') {
-      trustedScreen[7] = 0xE4;
-      trustedScreen[8] = 0x48;
-      writeAscii(trustedScreen, 26, 'pF');
+    for (const slot of [5, 7, 6]) {
+      const offset = slot * 8;
+      for (let row = 0; row < 8; row++) {
+        signature += String.fromCharCode(cgram[offset + row]);
+      }
     }
 
-    drawScreen(trustedScreen, trustedCgram);
+    return signature;
+  }
+
+  function updateMeterGlyphs(cgram, entering) {
+    const signature = getMeterGlyphSignature(cgram);
+
+    if (entering || meterGlyphSignature === '') {
+      meterCgram.set(cgram);
+      meterGlyphSignature = signature;
+      pendingMeterGlyphSignature = '';
+      pendingMeterGlyphCount = 0;
+      return;
+    }
+
+    if (signature === meterGlyphSignature) {
+      pendingMeterGlyphSignature = '';
+      pendingMeterGlyphCount = 0;
+      return;
+    }
+
+    if (signature !== pendingMeterGlyphSignature) {
+      pendingMeterGlyphSignature = signature;
+      pendingMeterGlyphCount = 1;
+      return;
+    }
+
+    pendingMeterGlyphCount++;
+
+    // PIC обновляет CGRAM построчно. Принимаем новую картинку только после
+    // двух одинаковых снимков, чтобы не рисовать недособранный значок.
+    if (pendingMeterGlyphCount >= 2) {
+      meterCgram.set(cgram);
+      meterGlyphSignature = signature;
+      pendingMeterGlyphSignature = '';
+      pendingMeterGlyphCount = 0;
+    }
+  }
+
+  function drawMeterSnapshot(screen, cgram, entering) {
+    const frequency = extractFrequency(screen);
+    const row1Values = numericTokens(screen, 0, 16);
+    const row2Values = numericTokens(screen, 16, 32);
+    const fwdOffset = findAscii(screen, 16, 32, 'FWD=');
+    const refOffset = findAscii(screen, 16, 32, 'REF=');
+
+    let swr = null;
+    for (const token of row1Values) {
+      if (token.offset >= 9) swr = token.value;
+    }
+
+    let fwd = extractValueAfter(screen, fwdOffset);
+    let ref = extractValueAfter(screen, refOffset);
+
+    // Если одна подпись поймана с ошибкой, значения всё равно обычно целы.
+    // Первое число второй строки — FWD, последнее — REF.
+    if (!fwd && row2Values.length >= 2) fwd = row2Values[0].value;
+    if (!ref && row2Values.length >= 2) {
+      ref = row2Values[row2Values.length - 1].value;
+    }
+
+    setMeterField(0, 6, frequency);
+    writeAscii(meterScreen, 6, 'MHz');
+    meterScreen[9] = 5;
+    meterScreen[10] = 7;
+    meterScreen[11] = 6;
+    meterScreen[12] = SPACE;
+    setMeterField(13, 3, swr);
+
+    writeAscii(meterScreen, 16, 'FWD=');
+    setMeterField(20, 3, fwd);
+    meterScreen[23] = SPACE;
+    meterScreen[24] = SPACE;
+    writeAscii(meterScreen, 25, 'REF=');
+    setMeterField(29, 3, ref);
+
+    updateMeterGlyphs(cgram, entering);
+    drawScreen(meterScreen, meterCgram);
+  }
+
+  function screenSignature(screen) {
+    let signature = '';
+
+    for (let i = 0; i < screen.length; i++) {
+      signature += String.fromCharCode(screen[i]);
+    }
+
+    return signature;
   }
 
   function drawSnapshot(data) {
@@ -601,55 +772,38 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
     const screen = data.subarray(1, 33);
     const cgram = data.subarray(33, 97);
-    const version = data[97];
     const mainKind = detectMainKind(screen);
 
-    if (mainKind) {
-      pendingUnanchoredValid = false;
-      displayedMainKind = mainKind;
-      applySnapshot(screen, cgram, mainKind);
+    if (mainKind === 'meter') {
+      const entering = displayedMainKind !== 'meter';
+      displayedMainKind = 'meter';
+      pendingRawSignature = '';
+      drawMeterSnapshot(screen, cgram, entering);
       return;
     }
 
-    // При уходе с основного экрана ждём только одно подтверждение того же
-    // снимка. Это отбрасывает посимвольный промежуточный кадр, но Setup Mode
-    // появляется уже на следующем запросе и затем идёт без фильтрации.
+    if (mainKind === 'bar') {
+      displayedMainKind = 'bar';
+      pendingRawSignature = '';
+      drawScreen(screen, cgram);
+      return;
+    }
+
+    // При выходе с основного экрана один раз подтверждаем новый текст.
+    // Это не даёт промежуточной посимвольной записи стереть устойчивый кадр.
     if (displayedMainKind) {
-      if (
-        pendingUnanchoredValid &&
-        pendingUnanchoredVersion === version &&
-        sameBytes(pendingUnanchoredScreen, screen) &&
-        sameBytes(pendingUnanchoredCgram, cgram)
-      ) {
-        pendingUnanchoredValid = false;
-        displayedMainKind = null;
-        applySnapshot(screen, cgram, null);
-      }
-      else {
-        pendingUnanchoredScreen.set(screen);
-        pendingUnanchoredCgram.set(cgram);
-        pendingUnanchoredVersion = version;
-        pendingUnanchoredValid = true;
+      const signature = screenSignature(screen);
+
+      if (signature !== pendingRawSignature) {
+        pendingRawSignature = signature;
+        return;
       }
 
-      return;
+      displayedMainKind = null;
+      pendingRawSignature = '';
     }
 
-    applySnapshot(screen, cgram, null);
-  }
-
-  function showOtaMode() {
-    clearTimeout(lcdRequestTimer);
-    clearTimeout(lcdRequestWatchdog);
-    lcdRequestPending = false;
-
-    document.getElementById('controls').style.display = 'none';
-    document.getElementById('otaButton').style.display = 'none';
-
-    drawScreen(asciiScreen(
-      '  UPDATE MODE   ',
-      'START IDE UPLOAD'
-    ), blankCgram);
+    drawScreen(screen, cgram);
   }
 
   function requestLcdSnapshot() {
@@ -750,8 +904,15 @@ const char indexHtml[] PROGMEM = R"rawliteral(
         drawSnapshot(data);
         scheduleLcdSnapshotRequest();
       }
-      else if (data.length >= 1 && data[0] === PACKET_OTA) {
-        showOtaMode();
+      else if (data.length === 1 && data[0] === PACKET_LCD_WAIT) {
+        clearTimeout(lcdRequestWatchdog);
+        lcdRequestPending = false;
+
+        clearTimeout(lcdRequestTimer);
+        lcdRequestTimer = setTimeout(
+          requestLcdSnapshot,
+          LCD_BUSY_RETRY_MS
+        );
       }
     };
   }
@@ -817,12 +978,14 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
     if (index === 8) {
       displayedMainKind = null;
-      pendingUnanchoredValid = false;
+      pendingRawSignature = '';
+      meterGlyphSignature = '';
+      pendingMeterGlyphSignature = '';
+      pendingMeterGlyphCount = 0;
+      meterCgram.fill(0);
 
       if (active) {
-        trustedScreen.fill(SPACE);
-        trustedCgram.fill(0);
-        drawScreen(trustedScreen, trustedCgram);
+        drawScreen(blankScreen(), blankCgram);
       }
       else {
         drawScreen(powerOffScreen, blankCgram);
@@ -1034,14 +1197,6 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     }
   }
 
-  function startOta() {
-    if (!confirm('ВКЛЮЧИТЬ РЕЖИМ ПРОШИВКИ?')) return;
-
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send('START_OTA');
-    }
-  }
-
   [0, 3, 8].forEach(updateButtonVisual);
 
   connect();
@@ -1074,6 +1229,176 @@ button{margin:8px;padding:12px 25px;background:#064;color:#fff;border:0;border-r
   <input name="p" type="password" placeholder="Password"><br>
   <button type="submit">SAVE AND REBOOT</button>
 </form>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// СТРАНИЦА ОБНОВЛЕНИЯ ЧЕРЕЗ HTTP
+// ============================================================================
+
+const char updateHtml[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MFJ-993B Firmware Update</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #111;
+    color: #bbb;
+    font-family: sans-serif;
+    padding: 18px;
+  }
+  .panel {
+    width: min(430px, 100%);
+    background: #191919;
+    border: 1px solid #3a3a3a;
+    border-radius: 10px;
+    padding: 22px;
+    box-shadow: 0 0 24px #000;
+  }
+  h2 { margin: 0 0 15px; color: #5d6; font-size: 20px; }
+  p { color: #999; font-size: 13px; line-height: 1.45; }
+  input {
+    display: block;
+    width: 100%;
+    margin: 18px 0 12px;
+    padding: 11px;
+    color: #ddd;
+    background: #222;
+    border: 1px solid #555;
+    border-radius: 5px;
+  }
+  button {
+    width: 100%;
+    padding: 13px;
+    color: #fff;
+    background: #075f31;
+    border: 1px solid #168b4d;
+    border-radius: 5px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .bar {
+    height: 16px;
+    margin-top: 16px;
+    overflow: hidden;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #222;
+  }
+  #progress {
+    width: 0;
+    height: 100%;
+    background: #2b5;
+    transition: width .12s linear;
+  }
+  #status {
+    min-height: 36px;
+    margin-top: 12px;
+    color: #aaa;
+    font-family: monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+  }
+  a { color: #699; font-size: 12px; }
+  .warning { color: #d98; }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <h2>Обновление прошивки</h2>
+    <p>Выберите основной файл <b>*.ino.bin</b>. Не выбирайте bootloader, partitions или merged-файл.</p>
+    <p class="warning">Не отключайте питание и не закрывайте страницу во время передачи.</p>
+
+    <input id="firmware" type="file" accept=".bin,application/octet-stream">
+    <button id="upload" disabled>ЗАГРУЗИТЬ И ПЕРЕЗАГРУЗИТЬ</button>
+
+    <div class="bar"><div id="progress"></div></div>
+    <div id="status">Файл не выбран</div>
+    <a href="/">Вернуться к управлению</a>
+  </div>
+
+<script>
+  const firmware = document.getElementById('firmware');
+  const upload = document.getElementById('upload');
+  const progress = document.getElementById('progress');
+  const status = document.getElementById('status');
+
+  function setReadyState() {
+    const file = firmware.files[0];
+    const valid = file && file.name.toLowerCase().endsWith('.ino.bin');
+
+    upload.disabled = !valid;
+    status.textContent = valid
+      ? file.name + ' — ' + Math.ceil(file.size / 1024) + ' KiB'
+      : (file ? 'Нужен файл с окончанием .ino.bin' : 'Файл не выбран');
+  }
+
+  firmware.addEventListener('change', setReadyState);
+
+  upload.addEventListener('click', () => {
+    const file = firmware.files[0];
+
+    if (!file || !file.name.toLowerCase().endsWith('.ino.bin')) return;
+    if (!confirm('Начать обновление прошивки?')) return;
+
+    upload.disabled = true;
+    firmware.disabled = true;
+    progress.style.width = '0%';
+    status.textContent = 'Подготовка...';
+
+    const body = new FormData();
+    body.append('firmware', file, file.name);
+
+    const request = new XMLHttpRequest();
+    request.open('POST', '/update');
+    request.timeout = 300000;
+
+    request.upload.onprogress = event => {
+      if (!event.lengthComputable) return;
+
+      const percent = Math.round(event.loaded * 100 / event.total);
+      progress.style.width = percent + '%';
+      status.textContent = 'Передача: ' + percent + '%';
+    };
+
+    request.onload = () => {
+      if (request.status === 200) {
+        progress.style.width = '100%';
+        status.textContent = 'Готово. ESP перезагружается...';
+        setTimeout(() => { location.href = '/'; }, 8000);
+        return;
+      }
+
+      status.textContent = 'Ошибка: ' + (request.responseText || request.status);
+      upload.disabled = false;
+      firmware.disabled = false;
+    };
+
+    request.onerror = () => {
+      status.textContent = 'Соединение прервано. Подождите 10 секунд и проверьте основную страницу.';
+      setTimeout(() => { location.href = '/'; }, 10000);
+    };
+
+    request.ontimeout = () => {
+      status.textContent = 'Превышено время ожидания. Проверьте доступность ESP.';
+      upload.disabled = false;
+      firmware.disabled = false;
+    };
+
+    request.send(body);
+  });
+</script>
 </body>
 </html>
 )rawliteral";
@@ -1131,6 +1456,7 @@ void processCommand(uint8_t command, uint32_t now)
 
         memset(lcdScreen, ' ', sizeof(lcdScreen));
         lcdVersion++;
+        lastDdramChangeUs = now;
 
         portEXIT_CRITICAL(&lcdMux);
 
@@ -1222,7 +1548,7 @@ void processCgramData(uint8_t value, uint32_t now)
     }
 }
 
-void processDdramData(uint8_t value)
+void processDdramData(uint8_t value, uint32_t now)
 {
     int position = addressToPosition(lcdAddress);
 
@@ -1237,6 +1563,7 @@ void processDdramData(uint8_t value)
     if (lcdScreen[position] != value) {
         lcdScreen[position] = value;
         lcdVersion++;
+        lastDdramChangeUs = now;
     }
 
     portEXIT_CRITICAL(&lcdMux);
@@ -1255,7 +1582,7 @@ void processData(uint8_t value, uint32_t now)
         processCgramData(value, now);
     }
     else if (lcdAddressSpace == LCD_SPACE_DDRAM) {
-        processDdramData(value);
+        processDdramData(value, now);
     }
     else {
         rejectedDataCounter++;
@@ -1291,8 +1618,8 @@ static inline void processCapturedNibble(
             timeoutCounter++;
         }
 
-        // Пауза сбрасывает только недособранный байт. Контроллер LCD
-        // сохраняет выбранную DDRAM/CGRAM и текущий адрес.
+        // Сбрасываем только недособранный байт. Выбранную область и адрес
+        // HD44780 после паузы не забывает — это поведение проверенной версии.
         stage = 0;
     }
 
@@ -1334,6 +1661,7 @@ void clearCapturedLcdBeforePowerOn()
     memset(lcdCgram, 0, sizeof(lcdCgram));
     memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
     lcdVersion++;
+    lastDdramChangeUs = micros();
 
     portEXIT_CRITICAL(&lcdMux);
 
@@ -1393,40 +1721,6 @@ void releaseMomentaryButtons()
 }
 
 // ============================================================================
-// OTA
-// ============================================================================
-
-void startOtaIfRequested()
-{
-    if (!otaMode || otaStarted) {
-        return;
-    }
-
-    otaStarted = true;
-
-    ArduinoOTA.setHostname("MFJ-Remote");
-    ArduinoOTA.setPort(3232);
-
-    ArduinoOTA.onStart([]() {
-        releaseMomentaryButtons();
-        Serial.println("OTA: start");
-    });
-
-    ArduinoOTA.onEnd([]() {
-        Serial.println("OTA: complete");
-    });
-
-    ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("OTA error: %u\n", error);
-    });
-
-    ArduinoOTA.begin();
-
-    Serial.print("OTA ready: ");
-    Serial.println(WiFi.localIP());
-}
-
-// ============================================================================
 // WEBSOCKET
 // ============================================================================
 
@@ -1436,12 +1730,41 @@ void sendLcdSnapshot(AsyncWebSocketClient *client)
         return;
     }
 
-    // Клиент запрашивает следующий кадр только после получения предыдущего.
-    // Поэтому в очереди WebSocket не накапливается история старых экранов.
+    // Текстовые знакоместа ждём до конца короткой посимвольной записи.
+    // CGRAM при этом может непрерывно анимироваться и кадр не блокирует.
+    uint32_t change = lastDdramChangeUs;
+
+    if (
+        change != 0 &&
+        (uint32_t)(micros() - change) < DISPLAY_IDLE_US
+    ) {
+        uint8_t waitPacket = 0xFC;
+        client->binary(&waitPacket, 1);
+        return;
+    }
+
+    // Клиент запрашивает следующий кадр только после получения предыдущего,
+    // поэтому в очереди WebSocket находится не более одного снимка.
     uint8_t lcdPacket[98];
     lcdPacket[0] = 0xFD;
 
     portENTER_CRITICAL(&lcdMux);
+
+    uint32_t changeInside = lastDdramChangeUs;
+
+    if (
+        changeInside != change ||
+        (
+            changeInside != 0 &&
+            (uint32_t)(micros() - changeInside) < DISPLAY_IDLE_US
+        )
+    ) {
+        portEXIT_CRITICAL(&lcdMux);
+
+        uint8_t waitPacket = 0xFC;
+        client->binary(&waitPacket, 1);
+        return;
+    }
 
     memcpy(&lcdPacket[1], lcdScreen, 32);
     memcpy(&lcdPacket[33], lcdCgram, 64);
@@ -1489,35 +1812,16 @@ void handleWebSocketEvent(
     if (
         length == 1 &&
         data[0] == 'L' &&
-        !otaMode
+        !webUpdateInProgress
     ) {
         sendLcdSnapshot(client);
         return;
     }
 
     if (
-        length == 9 &&
-        memcmp(data, "START_OTA", 9) == 0
-    ) {
-        if (!otaMode) {
-            uint8_t message = 0xFE;
-
-            ws.binaryAll(&message, 1);
-            releaseMomentaryButtons();
-
-            stage = 0;
-            lcdAddressSpace = LCD_SPACE_NONE;
-            cgramCandidateActive = false;
-            otaMode = true;
-        }
-
-        return;
-    }
-
-    if (
         length == 10 &&
         data[0] == 'B' &&
-        !otaMode
+        !webUpdateInProgress
     ) {
         uint16_t newMask = 0;
 
@@ -1543,14 +1847,24 @@ void TaskWeb(void *parameter)
     uint32_t lastCleanupMs = 0;
 
     for (;;) {
-        if (otaMode) {
-            startOtaIfRequested();
-            ArduinoOTA.handle();
-            vTaskDelay(pdMS_TO_TICKS(2));
-            continue;
+        uint32_t now = millis();
+
+        if (
+            webUpdateRestartPending &&
+            (int32_t)(now - webUpdateRestartAtMs) >= 0
+        ) {
+            ESP.restart();
         }
 
-        uint32_t now = millis();
+        if (
+            webUpdateInProgress &&
+            (uint32_t)(now - webUpdateLastActivityMs) >= 60000
+        ) {
+            Update.abort();
+            webUpdateFailed = true;
+            webUpdateInProgress = false;
+            Serial.println("HTTP update aborted: timeout");
+        }
 
         if ((uint32_t)(now - lastCleanupMs) >= 5000) {
             lastCleanupMs = now;
@@ -1675,6 +1989,118 @@ void setup()
         ESP.restart();
     });
 
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response =
+            request->beginResponse_P(
+                200,
+                "text/html; charset=utf-8",
+                updateHtml
+            );
+
+        response->addHeader(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        );
+        response->addHeader("Pragma", "no-cache");
+        response->addHeader("Expires", "0");
+
+        request->send(response);
+    });
+
+    server.on(
+        "/update",
+        HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            bool success =
+                webUpdateSucceeded &&
+                !webUpdateFailed &&
+                !Update.hasError();
+
+            AsyncWebServerResponse *response =
+                request->beginResponse(
+                    success ? 200 : 500,
+                    "text/plain; charset=utf-8",
+                    success
+                        ? "OK. RESTARTING..."
+                        : "UPDATE FAILED"
+                );
+
+            response->addHeader("Connection", "close");
+            request->send(response);
+
+            webUpdateInProgress = false;
+
+            if (success) {
+                webUpdateRestartAtMs = millis() + 2000;
+                webUpdateRestartPending = true;
+            }
+        },
+        [](AsyncWebServerRequest *request,
+           const String& filename,
+           size_t index,
+           uint8_t *data,
+           size_t length,
+           bool final) {
+            if (index == 0) {
+                webUpdateFailed = false;
+                webUpdateSucceeded = false;
+                webUpdateRestartPending = false;
+                webUpdateLastActivityMs = millis();
+                webUpdateInProgress = true;
+
+                releaseMomentaryButtons();
+
+                stage = 0;
+                firstNibble = 0;
+                lcdAddressSpace = LCD_SPACE_NONE;
+                cgramCandidateActive = false;
+
+                Serial.printf(
+                    "HTTP update: %s\n",
+                    filename.c_str()
+                );
+
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                    webUpdateFailed = true;
+                    Update.printError(Serial);
+                }
+            }
+
+            if (
+                !webUpdateFailed &&
+                length > 0 &&
+                Update.write(data, length) != length
+            ) {
+                webUpdateFailed = true;
+                Update.printError(Serial);
+            }
+
+            if (length > 0) {
+                webUpdateLastActivityMs = millis();
+            }
+
+            if (final) {
+                if (!webUpdateFailed) {
+                    if (Update.end(true)) {
+                        webUpdateSucceeded = true;
+
+                        Serial.printf(
+                            "HTTP update complete: %u bytes\n",
+                            (unsigned int)(index + length)
+                        );
+                    }
+                    else {
+                        webUpdateFailed = true;
+                        Update.printError(Serial);
+                    }
+                }
+                else {
+                    Update.end();
+                }
+            }
+        }
+    );
+
     ws.onEvent(handleWebSocketEvent);
     server.addHandler(&ws);
     server.begin();
@@ -1690,7 +2116,8 @@ void setup()
     );
 
     Serial.println("LCD capture: SAMPLE_DELAY=110, capture=s1");
-    Serial.println("Web LCD: raw 32-byte DDRAM + 64-byte CGRAM snapshots");
+    Serial.println("Web LCD: DDRAM settles for 12 ms; CGRAM does not block frames");
+    Serial.println("Nibble sync: reset incomplete byte only");
 }
 
 // ============================================================================
@@ -1699,7 +2126,7 @@ void setup()
 
 void loop()
 {
-    if (otaMode) {
+    if (webUpdateInProgress || webUpdateRestartPending) {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
@@ -1727,7 +2154,10 @@ void loop()
 
         pulseCounter++;
 
-        if (((s1 ^ s2) & MASK_LCD_BUS) != 0) {
+        bool sampleUnstable =
+            ((s1 ^ s2) & MASK_LCD_BUS) != 0;
+
+        if (sampleUnstable) {
             sampleDifferenceCounter++;
         }
 
@@ -1737,10 +2167,13 @@ void loop()
         uint8_t nibble =
             readNibble(reg);
 
+        uint32_t captureNow = micros();
+
         processCapturedNibble(
             nibble,
             currentRs,
-            micros()
+            captureNow
         );
+
     }
 }

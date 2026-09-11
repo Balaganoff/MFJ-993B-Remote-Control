@@ -1,140 +1,163 @@
 # MFJ-993B Remote Control
 
-Unofficial ESP32-based LAN remote control and 16x2 LCD mirror for the MFJ-993B IntelliTuner.
+Unofficial ESP32-based LAN remote control and browser LCD mirror for the MFJ-993B IntelliTuner.
 
-The ESP32 observes the tuner's HD44780-compatible LCD bus, reconstructs DDRAM and dynamic CGRAM characters, serves a mobile-friendly web interface, and electrically emulates the nine front-panel controls through an external interface stage.
+The ESP32 passively observes the tuner's 4-bit LCD bus, reconstructs the visible 16x2 screen and dynamic 5x8 custom characters, serves a mobile-friendly web interface, and controls the nine front-panel functions through an external switch-emulation stage.
 
-> **Project status:** experimental and hardware-specific. The current pin map and LCD sampling delay were tuned on one working installation. Verify every signal and voltage on your own hardware before connecting it.
+> **Status:** experimental and hardware-specific. The pin map and LCD sampling point were tuned on one working installation. Verify signal levels, polarity and wiring on your own hardware before connecting it.
 
-## Features
+## Current features
 
-- Live 16x2 LCD mirror in a browser, including dynamic CGRAM glyphs and bar graphs.
-- Nine controls: ANT, C-UP, L-UP, AUTO, MODE, C-DN, L-DN, TUNE, and POWER.
-- True press-and-hold operation for MODE, TUNE, and the C/L adjustment buttons.
-- Manual-defined shortcuts and protected power-on service operations.
-- Wi-Fi setup access point when no saved network can be reached.
-- WebSocket transport with one requested LCD frame in flight, preventing a backlog of stale screens.
-- Adaptive LCD requests: 25 ms normally and 100 ms while a momentary button is held.
-- ArduinoOTA mode for later firmware uploads over the local network.
+- Browser mirror of the 16x2 LCD, including DDRAM, CGRAM glyphs and tuning bars.
+- Stable main meter screen: frequency, `MHz`, SWR, `FWD=` and `REF=` are kept in fixed character cells.
+- Main-screen numeric values are accepted independently, so a damaged bus byte does not shift the entire browser display or erase the last valid value.
+- The three main-screen CGRAM indicators are updated only after two identical snapshots; partial glyph rewrites are not displayed.
+- CGRAM activity does not delay frequency, SWR, forward-power or reflected-power updates.
+- Nine controls: ANT, C-UP, L-UP, AUTO, MODE, C-DN, L-DN, TUNE and POWER.
+- True press-and-hold behavior for MODE, TUNE and C/L adjustment buttons.
+- Manual-defined shortcuts and confirmation-protected power-on service operations.
+- Wi-Fi configuration access point when the saved network is unavailable.
+- WebSocket request/response flow with no backlog of stale LCD frames.
+- Browser polling every 20 ms normally and every 100 ms while a momentary control is held.
+- Firmware upload from the browser at `/update` using the main `*.ino.bin` file.
 
-## How it works
+## Architecture
 
 ```mermaid
 flowchart LR
-    LCD["MFJ LCD bus<br>RS, E, DB4-DB7"] --> SHIFT["5 V to 3.3 V<br>level shifting"] --> ESP["ESP32<br>LCD decoder"]
-    ESP --> WS["HTTP + WebSocket"] --> UI["Phone or PC browser"]
-    UI --> BTN["Button commands"] --> ESP
-    ESP --> SW["Isolated switch drivers"] --> PANEL["MFJ front-panel lines"]
+    LCD["MFJ LCD bus<br>RS, E, DB4-DB7"] --> LEVEL["5 V to 3.3 V<br>input interface"] --> ESP["ESP32<br>LCD decoder"]
+    ESP --> WEB["HTTP + WebSocket"] --> UI["Phone or PC browser"]
+    UI --> ESP
+    ESP --> DRIVER["Isolated/open-collector<br>switch drivers"] --> PANEL["MFJ control lines"]
 ```
 
-The LCD capture loop runs on ESP32 core 1 at 240 MHz. A single GPIO register sample is taken 110 CPU cycles after E is observed high. Two 4-bit transfers are combined into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction, and the eight 5x8 custom characters.
+The capture loop runs on ESP32 core 1 at 240 MHz. It samples `GPIO_IN_REG` 110 CPU cycles after LCD `E` is observed high and combines two 4-bit transfers into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction and all eight custom characters.
 
-The web task runs on core 0. The browser sends `L` only after the previous LCD packet has arrived. Button packets always take priority and are sent immediately. See [WebSocket protocol](docs/protocol.md).
+Networking and housekeeping run on core 0. The browser requests the next snapshot only after the previous response, so slow Wi-Fi or a VPN cannot build a queue of obsolete screens. Button commands are sent immediately.
+
+The browser applies layout normalization only to the recognized `FWD=/REF=` meter screen. Tuning bars, L/C screens, Setup menus and service screens remain direct LCD copies.
 
 ## Repository layout
 
 ```text
-firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino  Main Arduino sketch
-tools/LCD1602_CGRAM_Terminal_110/                           Serial LCD/CGRAM diagnostic sketch
-docs/wiring.md                                             Wiring and electrical notes
+firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino  Main firmware
+tools/LCD1602_CGRAM_Terminal_110/                           Serial diagnostic firmware
+docs/wiring.md                                             Wiring and electrical safety
 docs/controls.md                                           Buttons and combinations
 docs/protocol.md                                           LCD capture and WebSocket protocol
+docs/firmware-update.md                                    Browser firmware-update procedure
+CHANGELOG.md                                                Notable firmware changes
 platformio.ini                                             Reproducible PlatformIO build
 .github/workflows/build.yml                                Automatic build check
 LICENSE                                                    MIT license
 ```
 
-## Hardware
+## Pin map used by the firmware
 
-- Classic dual-core ESP32 development board with the required GPIOs exposed.
-- 5 V to 3.3 V level shifting for all LCD signals read by the ESP32.
-- An isolated/open-collector switch-emulation stage for the tuner controls.
-- A stable regulated ESP32 supply. Do not feed 12-15 V directly into the ESP32.
-- Common reference ground where required by the selected interface circuit.
+### LCD inputs
 
-The firmware pin map is summarized below. Full details are in [Wiring](docs/wiring.md).
+| LCD signal | ESP32 GPIO |
+|---|---:|
+| E | 17 |
+| RS | 4 |
+| DB4 | 25 |
+| DB5 | 18 |
+| DB6 | 19 |
+| DB7 | 23 |
 
-| Function | ESP32 GPIO | Direction at ESP32 |
-|---|---:|---|
-| LCD E | 17 | Input |
-| LCD RS | 4 | Input |
-| LCD DB4 | 25 | Input |
-| LCD DB5 | 18 | Input |
-| LCD DB6 | 19 | Input |
-| LCD DB7 | 23 | Input |
-| ANT | 14 | Output to switch driver |
-| C-UP | 26 | Output to switch driver |
-| L-UP | 27 | Output to switch driver |
-| AUTO | 33 | Output to switch driver |
-| MODE | 13 | Output to switch driver |
-| C-DN | 2 | Output to switch driver |
-| L-DN | 5 | Output to switch driver |
-| TUNE | 21 | Output to switch driver |
-| POWER | 32 | Output, active-low in this build |
+### Control outputs
+
+| Bit | Control | ESP32 GPIO | UI behavior |
+|---:|---|---:|---|
+| 0 | ANT | 14 | Latched |
+| 1 | C-UP | 26 | Momentary/hold |
+| 2 | L-UP | 27 | Momentary/hold |
+| 3 | AUTO | 33 | Latched |
+| 4 | MODE | 13 | Momentary/hold |
+| 5 | C-DN | 2 | Momentary/hold |
+| 6 | L-DN | 5 | Momentary/hold |
+| 7 | TUNE | 21 | Momentary/hold |
+| 8 | POWER | 32 | Latched; physical output is inverted |
+
+See [Wiring](docs/wiring.md) before making any connection.
 
 ## Electrical and RF safety
 
-**Do not connect the MFJ LCD bus directly to ESP32 GPIO.** The tuner schematic shows 5 V LCD logic, while Espressif specifies a 3.6 V GPIO tolerance. Use a proper level translator or resistor dividers on RS, E, and DB4-DB7.
+**Do not connect a 5 V LCD signal directly to an ESP32 GPIO.** Use a suitable 5 V-to-3.3 V level translator or calculated resistor dividers on RS, E and DB4-DB7.
 
-Do not drive the tuner switch nets directly from push-pull ESP32 outputs. Use a correctly designed transistor, optocoupler, analog-switch, or relay interface that behaves like the original contacts and does not back-feed the MFJ logic.
+Do not connect push-pull ESP32 outputs directly to the tuner's switch nets. Use an appropriate optocoupler, transistor/open-collector, analog-switch or relay interface that behaves like the original contact and does not feed voltage back into either device.
 
-Disconnect DC power, transmitter, and antennas before opening the tuner. Never work inside it while transmitting. The RF network can carry hazardous voltages and cause RF burns. Follow the warnings in the official MFJ manual.
+Disconnect the transmitter, antennas and DC power before opening the tuner. Never work inside it while transmitting. Follow all warnings and service conditions in the MFJ manual.
 
-## Build and first upload
+## Arduino IDE build and initial USB upload
 
-1. Install [Arduino IDE](https://docs.arduino.cc/software/ide/) and the [Arduino core for ESP32](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html).
-2. Install [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer) and its ESP32 dependency [AsyncTCP](https://github.com/ESP32Async/AsyncTCP).
-3. Open `firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino`.
-4. Select the matching classic ESP32 board and set the CPU frequency to 240 MHz.
-5. Upload through USB. The sketch uses a Serial Monitor rate of 460800 baud.
-6. If saved Wi-Fi credentials are absent or the connection fails, join `MFJ993b-CONFIG` with password `12345678`.
-7. Open `http://192.168.4.1/`, enter the target Wi-Fi credentials, and wait for the ESP32 to restart.
-8. Read the new LAN IP in Serial Monitor and open it in a browser.
+1. Install [Arduino IDE](https://www.arduino.cc/en/software).
+2. Install the stable [Arduino core for ESP32](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html) using Boards Manager.
+3. Install these libraries using Library Manager:
+   - [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
+   - [AsyncTCP](https://github.com/ESP32Async/AsyncTCP)
+4. Open `firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino`.
+5. Select the matching classic ESP32 board and a 240 MHz CPU frequency. The tested PlatformIO target is `esp32dev`.
+6. Perform the first upload through USB. Serial Monitor speed is 460800 baud.
+7. If the saved Wi-Fi cannot be reached, connect to `MFJ993b-CONFIG` with password `12345678`.
+8. Open `http://192.168.4.1/`, enter the target Wi-Fi credentials and wait for restart.
+9. Open the assigned LAN IP in a browser.
 
-### PlatformIO
+## Later firmware updates from the web page
 
-[PlatformIO](https://docs.platformio.org/en/latest/core/index.html) users can build the same sketch from the repository root:
+The current firmware does **not** require an Arduino IDE network port, mDNS, UDP invitation or port 3232.
+
+1. In Arduino IDE choose **Sketch → Export Compiled Binary**.
+2. Open `http://<ESP-IP>/update` or click **Firmware Update (.bin)** on the control page.
+3. Select only the main file ending in `.ino.bin`.
+4. Do not select `bootloader.bin`, `partitions.bin` or a merged image.
+5. Keep power and network connectivity until the progress reaches 100%. The ESP32 restarts automatically.
+6. Reload the main page with `Ctrl+F5` if the browser retained an older embedded page.
+
+The same HTTP method works through a routed VPN when the ESP32 address and TCP port 80 are reachable. Detailed instructions and file locations are in [Firmware update](docs/firmware-update.md).
+
+## PlatformIO
+
+From the repository root:
 
 ```bash
 pio run
 ```
 
-The checked-in environment pins the ESP32 platform, AsyncTCP, ESPAsyncWebServer, board type, monitor rate, and required 240 MHz CPU clock. GitHub Actions runs the same build on every push and pull request.
+The environment pins:
 
-## Diagnostic sketch
+- `espressif32@6.12.0`
+- board `esp32dev`
+- CPU frequency 240 MHz
+- `ESP32Async/AsyncTCP@3.5.0`
+- `ESP32Async/ESPAsyncWebServer@3.12.0`
 
-`tools/LCD1602_CGRAM_Terminal_110/LCD1602_CGRAM_Terminal_110.ino` is a standalone serial sniffer used while tuning the capture timing. It prints stable DDRAM screens, active CGRAM slots and their 5x8 matrices, counters, address-space state, and sample differences. Sending `P` in Serial Monitor cycles the tuner's virtual POWER output OFF and ON so its LCD initialization and CGRAM definitions can be captured.
+The main image is generated as `.pio/build/esp32dev/firmware.bin`. GitHub Actions runs the same build on every push and pull request and publishes `MFJ993B_Remote_Control.ino.bin` as the `MFJ993B-Remote-Control-firmware` workflow artifact, ready for the browser update page.
 
-## OTA update
+## Diagnostic firmware
 
-Click **System Update (OTA)** at the bottom of the web page and confirm. The ESP32 releases all momentary controls, stops normal LCD/web processing, and starts ArduinoOTA as:
+`tools/LCD1602_CGRAM_Terminal_110/LCD1602_CGRAM_Terminal_110.ino` is a standalone test sketch, not the normal web firmware. It prints captured DDRAM, active CGRAM slots, 5x8 matrices and diagnostic counters to Serial Monitor at 460800 baud. Sending `P` performs a controlled tuner POWER OFF → ON cycle to capture LCD initialization.
 
-- hostname: `MFJ-Remote`
-- TCP port: `3232`
-- authentication: none
+## Security
 
-Select the network port in Arduino IDE and upload the updated sketch. OTA is intended only for a trusted local network. If OTA mode is entered but no upload is performed, restart the ESP32 to return to normal operation.
+The control page, Wi-Fi configuration form, WebSocket and firmware-update page do not require authentication. Use this device only on a trusted LAN or trusted VPN. Do not expose TCP port 80 directly to the public Internet. Change the configuration AP password in the source before deployment.
 
-## Security notes
-
-The web controls, Wi-Fi configuration page, WebSocket commands, and OTA mode do not currently require authentication. Do not expose this device to the public Internet or an untrusted Wi-Fi network. Change the configuration AP password in the sketch before deployment.
-
-## Official references
+## References
 
 - [MFJ-993B product page](https://mfjenterprises.com/products/mfj-993b)
 - [MFJ-993B instruction manual, version 2B (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-993B.pdf?v=1586534115)
 - [MFJ-991B/993B/994B/995 Rev. 2 schematic (PDF)](https://cdn.shopify.com/s/files/1/0289/7782/3843/files/MFJ-991B_993B_994B_Rev_2_Schematic.pdf?v=1586534155)
 - [Arduino core for ESP32 documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/)
-- [ArduinoOTA implementation in arduino-esp32](https://github.com/espressif/arduino-esp32/tree/master/libraries/ArduinoOTA)
-- [Espressif GPIO voltage guidance](https://docs.espressif.com/projects/esp-faq/en/latest/hardware-related/hardware-design.html)
-- [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
-- [AsyncTCP](https://github.com/ESP32Async/AsyncTCP)
+- [Espressif browser OTA update guide](https://docs.espressif.com/projects/arduino-esp32/en/latest/ota_web_update.html)
+- [ESP32Async/ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
+- [ESP32Async/AsyncTCP](https://github.com/ESP32Async/AsyncTCP)
+- [PlatformIO ESP32 Dev Module](https://docs.platformio.org/en/latest/boards/espressif32/esp32dev.html)
 
 ## License and trademarks
 
 Project source and original documentation are released under the [MIT License](LICENSE).
 
-MFJ, MFJ-993B, IntelliTuner, IntelliTune, InstantRecall, and other MFJ product names are trademarks of their respective owner. This is an independent community project and is not affiliated with or endorsed by MFJ Enterprises. The MFJ manuals and schematics are not redistributed here; the links above point to MFJ's official copies.
+MFJ, MFJ-993B, IntelliTuner and other MFJ product names are trademarks of their respective owner. This independent community project is not affiliated with or endorsed by MFJ Enterprises. MFJ manuals and schematics are not redistributed in this repository; the links above point to external copies.
 
 ---
 
@@ -142,44 +165,56 @@ MFJ, MFJ-993B, IntelliTuner, IntelliTune, InstantRecall, and other MFJ product n
 
 Неофициальный сетевой пульт для антенного тюнера MFJ-993B на ESP32 с зеркалом штатного LCD 16x2 в браузере.
 
-ESP32 пассивно считывает 4-битную шину LCD, восстанавливает обычные и пользовательские символы, поднимает локальную веб-страницу и через внешние ключи имитирует нажатия девяти кнопок передней панели.
+ESP32 пассивно считывает шину дисплея, восстанавливает DDRAM и динамические символы CGRAM, отдаёт веб-интерфейс и через внешний ключевой каскад имитирует девять кнопок передней панели.
 
-> **Статус проекта:** экспериментальный и привязанный к конкретной аппаратной сборке. Распиновка и задержка выборки проверены на одном экземпляре. До подключения обязательно проверьте уровни и сигналы своего устройства.
+> **Статус:** экспериментальная прошивка для конкретной аппаратной сборки. Перед подключением обязательно проверьте уровни, полярность и распиновку своего устройства.
 
-## Возможности
+## Что работает
 
-- Живое зеркало LCD 16x2, включая CGRAM-символы и бегущие шкалы.
+- LCD 16x2 в браузере, включая пользовательские символы и бегущие шкалы.
+- На основном экране частота, `MHz`, КСВ, `FWD=` и `REF=` закреплены за постоянными знакоместами.
+- Ошибочный байт не сдвигает весь основной экран и не стирает последнее корректное значение.
+- Три CGRAM-значка основного экрана меняются только после двух одинаковых снимков; промежуточная построчная перерисовка не показывается.
+- CGRAM больше не задерживает обновление частоты, КСВ, прямой и отражённой мощности.
 - ANT, C-UP, L-UP, AUTO, MODE, C-DN, L-DN, TUNE и POWER.
-- Настоящее удержание MODE/TUNE/C/L без искусственного автоотпускания.
-- Комбинации из руководства и защищённые подтверждением сервисные операции при включении.
-- Режим точки доступа для первоначальной настройки Wi-Fi.
-- WebSocket без очереди старых кадров: одновременно запрошен только один снимок LCD.
-- Опрос LCD на веб-странице раз в 25 мс, при удержании кнопки — раз в 100 мс.
-- Обновление прошивки по локальной сети через ArduinoOTA.
+- Удержание MODE/TUNE/C/L без программного автоотпускания.
+- Дополнительные сочетания и сервисные операции при включении.
+- Первичная настройка Wi-Fi через точку доступа.
+- Один LCD-запрос в полёте — старые кадры не накапливаются даже через VPN.
+- Опрос каждые 20 мс, при удержании кнопки — каждые 100 мс.
+- Загрузка основной прошивки `.ino.bin` прямо из браузера через `/update`.
 
 ## Быстрый запуск
 
-1. Установите [Arduino IDE](https://docs.arduino.cc/software/ide/) и [Arduino core for ESP32](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html).
-2. Установите библиотеки [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer) и [AsyncTCP](https://github.com/ESP32Async/AsyncTCP).
-3. Откройте `firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino`.
-4. Выберите подходящую классическую ESP32 и частоту CPU 240 МГц.
-5. Загрузите скетч по USB. Скорость Serial Monitor — 460800 бод.
-6. Если ESP32 не подключилась к сохранённой сети, соединитесь с `MFJ993b-CONFIG`, пароль `12345678`.
-7. Откройте `http://192.168.4.1/`, сохраните SSID и пароль домашней сети.
-8. После перезапуска узнайте новый IP в Serial Monitor и откройте его в браузере.
+1. Установите [Arduino IDE](https://www.arduino.cc/en/software).
+2. Через Boards Manager установите стабильный [Arduino core for ESP32](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html).
+3. Через Library Manager установите [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer) и [AsyncTCP](https://github.com/ESP32Async/AsyncTCP).
+4. Откройте `firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino`.
+5. Выберите классическую ESP32 с частотой CPU 240 МГц и выполните первую прошивку по USB.
+6. Если домашняя сеть недоступна, подключитесь к `MFJ993b-CONFIG`, пароль `12345678`.
+7. Откройте `http://192.168.4.1/`, сохраните SSID и пароль сети.
+8. После перезапуска откройте новый IP ESP32 в браузере.
 
-Альтернативная сборка через PlatformIO выполняется из корня репозитория командой `pio run`. Версии платформы и библиотек зафиксированы в `platformio.ini`; GitHub Actions проверяет сборку при каждом изменении.
+## Обновление без USB
 
-Диагностический скетч `tools/LCD1602_CGRAM_Terminal_110/LCD1602_CGRAM_Terminal_110.ino` выводит DDRAM/CGRAM и счётчики захвата в терминал. Команда `P` выполняет цикл POWER OFF → ON для перехвата инициализации дисплея.
+1. В Arduino IDE выберите **Скетч → Экспорт бинарного файла**.
+2. На странице управления нажмите **Firmware Update (.bin)** либо откройте `http://<IP-ESP>/update`.
+3. Выберите только основной файл `*.ino.bin`.
+4. Не выбирайте `bootloader.bin`, `partitions.bin` и `merged.bin`.
+5. Дождитесь 100% и автоматической перезагрузки ESP32.
+6. После обновления страницы используйте `Ctrl+F5`, если браузер показывает старый интерфейс.
 
-## Важно по подключению
+Сетевой порт Arduino IDE, mDNS и порт 3232 этой версии не нужны. Обновление выполняется обычным HTTP-запросом и может работать через маршрутизируемый VPN. Подробности: [docs/firmware-update.md](docs/firmware-update.md).
 
-Штатный LCD работает от 5 В. Входы ESP32 не являются 5-вольтовыми — между LCD и ESP32 обязательно нужны преобразователи уровня или рассчитанные делители. Кнопочные GPIO также нельзя напрямую соединять с логическими цепями тюнера: необходимы ключи, имитирующие сухое замыкание контактов.
+## Документация
 
-Подробная распиновка и требования к интерфейсу: [docs/wiring.md](docs/wiring.md). Кнопки и сочетания: [docs/controls.md](docs/controls.md). Формат обмена и устройство захвата LCD: [docs/protocol.md](docs/protocol.md).
+- [Подключение и безопасность](docs/wiring.md)
+- [Кнопки и сочетания](docs/controls.md)
+- [Захват LCD и протокол WebSocket](docs/protocol.md)
+- [Обновление прошивки через браузер](docs/firmware-update.md)
 
-## OTA и безопасность
+Диагностический скетч `tools/LCD1602_CGRAM_Terminal_110/LCD1602_CGRAM_Terminal_110.ino` является отдельной тестовой прошивкой без основного веб-пульта.
 
-Ссылка **System Update (OTA)** переводит контроллер в ArduinoOTA с именем `MFJ-Remote` и портом `3232`. Пароль OTA пока не задан. Веб-пульт также не имеет авторизации, поэтому устройство разрешено использовать только в доверенной локальной сети и нельзя публиковать в Интернет.
+Веб-пульт, настройка Wi-Fi, WebSocket и страница обновления не имеют авторизации. Используйте устройство только в доверенной локальной сети или через доверенный VPN и не публикуйте TCP-порт 80 в Интернет.
 
-Проект распространяется по лицензии [MIT](LICENSE). Это независимая разработка, не связанная с MFJ Enterprises. Руководство и схема MFJ не копируются в репозиторий — используются только официальные ссылки из раздела выше.
+Проект распространяется по лицензии [MIT](LICENSE) и не связан с MFJ Enterprises.
