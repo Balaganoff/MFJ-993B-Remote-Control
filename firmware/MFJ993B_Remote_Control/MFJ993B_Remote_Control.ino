@@ -167,7 +167,7 @@ private:
         ++clearGeneration_;
     }
 
-    void selectFixedRow(uint8_t address) {
+    void selectFixedAddress(uint8_t address) {
         address_ = address;
         shift_ = 0;
         increment_ = true;
@@ -226,19 +226,19 @@ private:
     }
 
     void commandFixed(uint8_t value) {
-        // This deliberately follows the successful original parser:
-        // clear, absolute beginning of line 1, absolute beginning of line 2.
         if (value == 0x01) {
             clearDisplay();
         }
         else if (value == 0x02 || value == 0x03) {
-            selectFixedRow(0x00);
+            selectFixedAddress(0x00);
         }
-        else if (value == 0x80) {
-            selectFixedRow(0x00);
+        else if (value >= 0x80 && value <= 0x8F) {
+            // The controller often updates only a changed fragment of row 1.
+            selectFixedAddress(value & 0x0F);
         }
-        else if (value == 0xC0) {
-            selectFixedRow(0x40);
+        else if (value >= 0xC0 && value <= 0xCF) {
+            // The controller often updates only a changed fragment of row 2.
+            selectFixedAddress(static_cast<uint8_t>(0x40 | (value & 0x0F)));
         }
         else if ((value & 0xC0) == 0x40) {
             address_ = value & 0x3F;
@@ -246,13 +246,10 @@ private:
             space_ = Cgram;
         }
         else if (value & 0x80) {
-            // Do not trust 0x81..0xBF or 0xC1..0xFF as a text position.
-            // If a row anchor was damaged, discard its data until 0x80/0xC0.
+            // Ignore hidden or invalid DDRAM positions until a visible address.
             space_ = Unknown;
         }
-        // Function, entry, cursor/display-shift and display-control commands
-        // are intentionally ignored: the original mirror did not let them
-        // displace the two visible rows.
+        // Other LCD control commands cannot move the two-row mirror.
     }
 
     void advance(bool forward) {
