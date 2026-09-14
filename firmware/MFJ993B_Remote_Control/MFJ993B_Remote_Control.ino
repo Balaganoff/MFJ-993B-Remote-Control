@@ -1,5 +1,5 @@
-// MFJ-993B Remote Control — strict original-style row capture, 2026-09-14
-// Classic dual-core ESP32 only. Hardware pins and HTTP uploader are preserved.
+// MFJ-993B Remote Control — terminal-proven LCD capture with a web mirror
+// Classic dual-core ESP32. The LCD bus is observed only; R/W remains grounded.
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -8,7 +8,7 @@
 #include "soc/gpio_reg.h"
 
 // ============================================================================
-// ПИНЫ — ПРОВЕРЕННАЯ РАСКЛАДКА
+// HARDWARE
 // ============================================================================
 
 const uint8_t BTN_PINS[9] = {
@@ -28,425 +28,289 @@ const uint32_t MASK_DB4 = 1UL << PIN_DB4;
 const uint32_t MASK_DB5 = 1UL << PIN_DB5;
 const uint32_t MASK_DB6 = 1UL << PIN_DB6;
 const uint32_t MASK_DB7 = 1UL << PIN_DB7;
-
 const uint32_t MASK_LCD_BUS =
-    MASK_RS  |
-    MASK_DB4 |
-    MASK_DB5 |
-    MASK_DB6 |
-    MASK_DB7;
+    MASK_RS | MASK_DB4 | MASK_DB5 | MASK_DB6 | MASK_DB7;
 
+// This is the sample point proven by the terminal capture.
 const uint32_t SAMPLE_DELAY = 110;
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
-const uint32_t NIBBLE_TIMEOUT_CYCLES = 240 * NIBBLE_TIMEOUT_US;
-const uint32_t ENABLE_STUCK_CYCLES = 240 * 20;
+const uint32_t DISPLAY_IDLE_US = 12000;
+const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 
-// Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
-    (1U << 1) |
-    (1U << 2) |
-    (1U << 4) |
-    (1U << 5) |
-    (1U << 6) |
-    (1U << 7);
+    (1U << 1) | (1U << 2) | (1U << 4) |
+    (1U << 5) | (1U << 6) | (1U << 7);
 
 const uint16_t INITIAL_BUTTON_MASK =
-    (1U << 3) | // AUTO
-    (1U << 8);  // POWER ON
+    (1U << 3) |  // AUTO
+    (1U << 8);   // POWER ON
 
 // ============================================================================
-// WEB / WIFI / ОБНОВЛЕНИЕ ПРОШИВКИ
+// NETWORK AND UPDATE STATE
 // ============================================================================
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Preferences prefs;
 
+volatile uint16_t buttonMask = INITIAL_BUTTON_MASK;
 volatile bool webUpdateInProgress = false;
 volatile bool webUpdateFailed = false;
 volatile bool webUpdateSucceeded = false;
 volatile bool webUpdateRestartPending = false;
 volatile uint32_t webUpdateRestartAtMs = 0;
 volatile uint32_t webUpdateLastActivityMs = 0;
-
-volatile uint16_t buttonMask = INITIAL_BUTTON_MASK;
-
+char webUpdateError[128] = "";
 
 // ============================================================================
-// LCD MODEL — no Arduino dependencies; the same code is exercised by host tests.
-// A quiet bus does NOT clear the address, DDRAM or CGRAM.
+// LCD STATE — THE SAME MODEL AS THE TERMINAL TEST
 // ============================================================================
 
-class LcdModel {
-public:
-    enum Space : uint8_t { Unknown, Ddram, Cgram };
-
-    explicit LcdModel(bool fixedRows = false) : fixedRows_(fixedRows) {}
-
-    void reset() {
-        memset(ddram_, ' ', sizeof(ddram_));
-        memset(cgram_, 0, sizeof(cgram_));
-        address_ = shift_ = 0;
-        space_ = Unknown;
-        increment_ = displayOn_ = true;
-        entryShift_ = false;
-        ++revision_;
-        ++clearGeneration_;
-    }
-
-    void loseAddress() { space_ = Unknown; }
-
-    void write(uint8_t value, bool data) {
-        if (fixedRows_) {
-            writeFixed(value,data);
-            return;
-        }
-
-        if (!data) {
-            commandGeneric(value);
-            return;
-        }
-
-        if (space_ == Cgram) {
-            writeCgram(value);
-        }
-        else if (space_ == Ddram) {
-            const int index = ddramIndex(address_);
-            if (index >= 0 && ddram_[index] != value) {
-                ddram_[index] = value;
-                ++revision_;
-            }
-            advance(increment_);
-            if (entryShift_) shiftDisplay(increment_);
-        }
-    }
-
-    void snapshot(uint8_t *screen, uint8_t *cgram) const {
-        for (unsigned row=0;row<2;row++) {
-            for (unsigned column=0;column<16;column++) {
-                const unsigned offset = fixedRows_ ? 0 : shift_;
-                screen[row*16+column] = displayOn_
-                    ? ddram_[row*40+(offset+column)%40]
-                    : ' ';
-            }
-        }
-        memcpy(cgram,cgram_,sizeof(cgram_));
-    }
-
-    uint8_t revision() const { return static_cast<uint8_t>(revision_); }
-    uint32_t clearGeneration() const { return clearGeneration_; }
-
-private:
-    uint8_t ddram_[80] = {};
-    uint8_t cgram_[64] = {};
-    uint8_t address_ = 0;
-    uint8_t shift_ = 0;
-    Space space_ = Unknown;
-    bool increment_ = true;
-    bool entryShift_ = false;
-    bool displayOn_ = true;
-    uint32_t revision_ = 0;
-    uint32_t clearGeneration_ = 0;
-    bool fixedRows_ = false;
-
-    static int ddramIndex(uint8_t address) {
-        if (address <= 0x27) return address;
-        if (address >= 0x40 && address <= 0x67)
-            return 40+address-0x40;
-        return -1;
-    }
-
-    void clearDisplay() {
-        memset(ddram_,' ',sizeof(ddram_));
-        address_ = shift_ = 0;
-        increment_ = true;
-        entryShift_ = false;
-        displayOn_ = true;
-        space_ = Ddram;
-        ++revision_;
-        ++clearGeneration_;
-    }
-
-    void selectFixedAddress(uint8_t address) {
-        address_ = address;
-        shift_ = 0;
-        increment_ = true;
-        entryShift_ = false;
-        displayOn_ = true;
-        space_ = Ddram;
-    }
-
-    void writeCgram(uint8_t value) {
-        // Captured PIC writes use only five pixel bits. ASCII here means that
-        // a DDRAM-address command was missed; do not turn text into a glyph.
-        if (fixedRows_ && (value & 0xE0)) {
-            space_ = Unknown;
-            return;
-        }
-
-        const uint8_t pixels = value & 0x1F;
-        if (cgram_[address_ & 0x3F] != pixels) {
-            cgram_[address_ & 0x3F] = pixels;
-            ++revision_;
-        }
-        address_ = static_cast<uint8_t>((address_+1)&0x3F);
-    }
-
-    void writeFixed(uint8_t value, bool data) {
-        if (!data) {
-            commandFixed(value);
-            return;
-        }
-
-        if (space_ == Cgram) {
-            writeCgram(value);
-            return;
-        }
-
-        if (space_ != Ddram) return;
-
-        const bool firstRow = address_ <= 0x0F;
-        const bool secondRow = address_ >= 0x40 && address_ <= 0x4F;
-        if (!firstRow && !secondRow) {
-            space_ = Unknown;
-            return;
-        }
-
-        const int index = ddramIndex(address_);
-        if (ddram_[index] != value) {
-            ddram_[index] = value;
-            ++revision_;
-        }
-
-        // A line can never spill into hidden DDRAM or into the other line.
-        if (address_ == 0x0F || address_ == 0x4F)
-            space_ = Unknown;
-        else
-            ++address_;
-    }
-
-    void commandFixed(uint8_t value) {
-        if (value == 0x01) {
-            clearDisplay();
-        }
-        else if (value == 0x02 || value == 0x03) {
-            selectFixedAddress(0x00);
-        }
-        else if (value >= 0x80 && value <= 0x8F) {
-            // The controller often updates only a changed fragment of row 1.
-            selectFixedAddress(value & 0x0F);
-        }
-        else if (value >= 0xC0 && value <= 0xCF) {
-            // The controller often updates only a changed fragment of row 2.
-            selectFixedAddress(static_cast<uint8_t>(0x40 | (value & 0x0F)));
-        }
-        else if ((value & 0xC0) == 0x40) {
-            address_ = value & 0x3F;
-            increment_ = true;
-            space_ = Cgram;
-        }
-        else if (value & 0x80) {
-            // Ignore hidden or invalid DDRAM positions until a visible address.
-            space_ = Unknown;
-        }
-        // Other LCD control commands cannot move the two-row mirror.
-    }
-
-    void advance(bool forward) {
-        if (forward) {
-            address_ = address_ == 0x27 ? 0x40
-                     : address_ == 0x67 ? 0x00
-                     : static_cast<uint8_t>((address_+1)&0x7F);
-        }
-        else {
-            address_ = address_ == 0x00 ? 0x67
-                     : address_ == 0x40 ? 0x27
-                     : static_cast<uint8_t>((address_-1)&0x7F);
-        }
-    }
-
-    void shiftDisplay(bool left) {
-        shift_ = static_cast<uint8_t>((shift_+(left ? 1 : 39))%40);
-        ++revision_;
-    }
-
-    void commandGeneric(uint8_t value) {
-        if (value & 0x80) {
-            address_ = value & 0x7F;
-            space_ = Ddram;
-        }
-        else if (value & 0x40) {
-            address_ = value & 0x3F;
-            space_ = Cgram;
-        }
-        else if (value & 0x20) {
-            // Function Set does not change stored data or the address.
-        }
-        else if (value & 0x10) {
-            if (value & 0x08)
-                shiftDisplay((value & 0x04) == 0);
-            else if (space_ == Cgram)
-                address_ = static_cast<uint8_t>(
-                    (address_+((value & 0x04) ? 1 : 63))&0x3F);
-            else
-                advance((value & 0x04) != 0);
-        }
-        else if (value & 0x08) {
-            displayOn_ = (value & 0x04) != 0;
-            ++revision_;
-        }
-        else if (value & 0x04) {
-            increment_ = (value & 0x02) != 0;
-            entryShift_ = (value & 0x01) != 0;
-        }
-        else if (value & 0x02) {
-            address_ = shift_ = 0;
-            space_ = Ddram;
-            ++revision_;
-        }
-        else if (value & 0x01) {
-            clearDisplay();
-        }
-    }
+enum LcdAddressSpace : uint8_t {
+    LCD_SPACE_NONE = 0,
+    LCD_SPACE_DDRAM,
+    LCD_SPACE_CGRAM
 };
 
-// Flags carried with a nibble, not inferred from time spent in a network task.
-static constexpr uint8_t SAMPLE_RS   = 0x10;
-static constexpr uint8_t SAMPLE_GAP  = 0x20;
-static constexpr uint8_t SAMPLE_LOSS = 0x40;
+uint8_t lcdScreen[32];
+uint8_t publishedScreen[32];
 
-class NibbleDecoder {
-public:
-    void reset() {
-        partial_ = seen_ = quarantine_ = startup_ = started_ = false;
-        lastRs_ = false;
-        first_ = 0;
-    }
+LcdAddressSpace lcdAddressSpace = LCD_SPACE_NONE;
+uint8_t lcdAddress = 0;
+uint8_t lcdCgramAddress = 0;
+bool entryIncrement = true;
 
-    void accept(uint8_t sample, LcdModel &lcd) {
-        const bool rs = (sample & SAMPLE_RS) != 0;
-        const bool gap = (sample & SAMPLE_GAP) != 0;
-        const bool boundary = gap || (seen_ && rs != lastRs_);
-        const uint8_t nibble = sample & 0x0F;
+uint8_t nibbleStage = 0;
+uint8_t firstNibble = 0;
+bool lastRs = false;
+uint32_t lastBusTime = 0;
+bool cgramCandidateActive = false;
+uint32_t cgramCandidateLastUs = 0;
 
-        if (sample & SAMPLE_LOSS) {
-            // Do not guess a new byte phase after an actually lost nibble.
-            lcd.loseAddress();
-            partial_ = false;
-            quarantine_ = !boundary;
-        }
-        if (boundary) {
-            // A truncated command must not leave its following text writing
-            // into the preceding row or a previously selected CGRAM slot.
-            if (partial_ && !lastRs_) lcd.loseAddress();
-            partial_ = false;
-            quarantine_ = false;
-        }
-        seen_ = true;
-        lastRs_ = rs;
-        if (quarantine_) return;
+volatile uint32_t lcdRevision = 0;
+volatile uint32_t publishedRevision = 0;
+volatile uint32_t lastLcdChangeUs = 0;
+volatile bool captureResetRequested = false;
 
-        // The reset preamble sends single 0x3 nibbles in 8-bit mode, then
-        // one 0x2 nibble to select 4-bit mode. Do not pair those as text.
-        if (!rs && !partial_ && nibble == 3 && !started_) {
-            startup_ = true;
-            return;
-        }
-        if (startup_) {
-            if (!rs && nibble == 3) return;
-            startup_ = false;
-            if (!rs && nibble == 2) { started_ = true; return; }
-        }
-
-        if (!partial_) {
-            first_ = nibble;
-            partial_ = true;
-        } else {
-            partial_ = false;
-            started_ = true;
-            lcd.write(static_cast<uint8_t>((first_ << 4) | nibble), rs);
-        }
-    }
-
-private:
-    bool partial_ = false, seen_ = false, lastRs_ = false;
-    bool quarantine_ = false, startup_ = false, started_ = false;
-    uint8_t first_ = 0;
-};
-
-// ============================================================================
-// ACQUISITION — single producer on core 1, single consumer on core 0.
-// This is a raw bus buffer, NOT a queue of old frames sent to the browser.
-// ============================================================================
-
-struct CaptureSample {
-    uint32_t cycles;
-    uint32_t payload;  // low byte: nibble/flags; upper 24 bits: reset epoch
-};
-
-class CaptureRing {
-public:
-    static constexpr uint32_t Capacity = 4096;
-
-    bool push(const CaptureSample &sample) {
-        const uint32_t head = __atomic_load_n(&head_, __ATOMIC_RELAXED);
-        const uint32_t tail = __atomic_load_n(&tail_, __ATOMIC_ACQUIRE);
-        if (head - tail >= Capacity) return false;
-        samples_[head & (Capacity - 1)] = sample;
-        __atomic_store_n(&head_, head + 1, __ATOMIC_RELEASE);
-        return true;
-    }
-
-    bool pop(CaptureSample &sample) {
-        const uint32_t tail = __atomic_load_n(&tail_, __ATOMIC_RELAXED);
-        const uint32_t head = __atomic_load_n(&head_, __ATOMIC_ACQUIRE);
-        if (tail == head) return false;
-        sample = samples_[tail & (Capacity - 1)];
-        __atomic_store_n(&tail_, tail + 1, __ATOMIC_RELEASE);
-        return true;
-    }
-
-private:
-    CaptureSample samples_[Capacity] = {};
-    alignas(4) uint32_t head_ = 0, tail_ = 0;
-};
-
-static_assert((CaptureRing::Capacity & (CaptureRing::Capacity - 1)) == 0,
-              "Capture ring size must be a power of two");
-
-CaptureRing captureRing;
-LcdModel lcd(true);  // Strict 0x80 / 0xC0 / 0x01 mirror.
-NibbleDecoder decoder;
 portMUX_TYPE lcdMux = portMUX_INITIALIZER_UNLOCKED;
-alignas(4) uint32_t captureEpoch = 1;
-uint32_t droppedNibbles = 0;  // Written only by the producer; diagnostic only.
 
-void resetCapturedLcd(bool clearPixels) {
+void clearLcdBuffers()
+{
     portENTER_CRITICAL(&lcdMux);
-    if (clearPixels) lcd.reset();
-    else lcd.loseAddress();
-    decoder.reset();
-    // Queued samples from before a power-on/reset can never enter the new model.
-    const uint32_t next =
-        (__atomic_load_n(&captureEpoch, __ATOMIC_RELAXED) + 1) & 0x00FFFFFF;
-    __atomic_store_n(&captureEpoch, next, __ATOMIC_RELEASE);
+    memset(lcdScreen, ' ', sizeof(lcdScreen));
+    memset(publishedScreen, ' ', sizeof(publishedScreen));
+    ++lcdRevision;
+    publishedRevision = lcdRevision;
+    lastLcdChangeUs = micros();
     portEXIT_CRITICAL(&lcdMux);
 }
 
-void drainCapturedLcd() {
-    CaptureSample sample;
-    // Bounded work keeps housekeeping alive even during a long LCD burst.
-    for (unsigned count = 0; count < 2048 && captureRing.pop(sample); ++count) {
+void resetDecoder()
+{
+    nibbleStage = 0;
+    firstNibble = 0;
+    lastRs = false;
+    lastBusTime = 0;
+    lcdAddressSpace = LCD_SPACE_NONE;
+    lcdAddress = 0;
+    lcdCgramAddress = 0;
+    entryIncrement = true;
+    cgramCandidateActive = false;
+    cgramCandidateLastUs = 0;
+}
+
+void requestCaptureReset(bool clearScreen)
+{
+    if (clearScreen) clearLcdBuffers();
+    __atomic_store_n(&captureResetRequested, true, __ATOMIC_RELEASE);
+}
+
+static inline uint8_t readNibble(uint32_t reg)
+{
+    uint8_t nibble = 0;
+    if (reg & MASK_DB4) nibble |= 0x01;
+    if (reg & MASK_DB5) nibble |= 0x02;
+    if (reg & MASK_DB6) nibble |= 0x04;
+    if (reg & MASK_DB7) nibble |= 0x08;
+    return nibble;
+}
+
+static inline int addressToPosition(uint8_t address)
+{
+    if (address <= 0x0F) return address;
+    if (address >= 0x40 && address <= 0x4F)
+        return 16 + address - 0x40;
+    return -1;
+}
+
+static inline bool isVisibleAddressCommand(uint8_t command)
+{
+    return
+        (command >= 0x80 && command <= 0x8F) ||
+        (command >= 0xC0 && command <= 0xCF);
+}
+
+static inline void advanceDdramAddress()
+{
+    if (entryIncrement)
+        lcdAddress = static_cast<uint8_t>((lcdAddress + 1) & 0x7F);
+    else
+        lcdAddress = static_cast<uint8_t>((lcdAddress - 1) & 0x7F);
+}
+
+void processCommand(uint8_t command, uint32_t now)
+{
+    if (command == 0x01) {
         portENTER_CRITICAL(&lcdMux);
-        const uint32_t epoch = __atomic_load_n(&captureEpoch, __ATOMIC_ACQUIRE);
-        if ((sample.payload >> 8) == epoch)
-            decoder.accept(static_cast<uint8_t>(sample.payload), lcd);
+        memset(lcdScreen, ' ', sizeof(lcdScreen));
+        ++lcdRevision;
+        lastLcdChangeUs = now;
         portEXIT_CRITICAL(&lcdMux);
+
+        lcdAddress = 0;
+        lcdAddressSpace = LCD_SPACE_DDRAM;
+        cgramCandidateActive = false;
+        return;
+    }
+
+    if (command == 0x02 || command == 0x03) {
+        lcdAddress = 0;
+        lcdAddressSpace = LCD_SPACE_DDRAM;
+        cgramCandidateActive = false;
+        return;
+    }
+
+    if ((command & 0xFC) == 0x04) {
+        entryIncrement = (command & 0x02) != 0;
+        cgramCandidateActive = false;
+        return;
+    }
+
+    if ((command & 0xC0) == 0x40) {
+        lcdCgramAddress = command & 0x3F;
+        cgramCandidateLastUs = now;
+        cgramCandidateActive = true;
+        lcdAddressSpace = LCD_SPACE_CGRAM;
+        return;
+    }
+
+    if (isVisibleAddressCommand(command)) {
+        lcdAddress = command & 0x7F;
+        lcdAddressSpace = LCD_SPACE_DDRAM;
+        cgramCandidateActive = false;
+        return;
+    }
+
+    // A hidden DDRAM address must never redirect following data into a
+    // previously visible cell.
+    if (command & 0x80) {
+        lcdAddressSpace = LCD_SPACE_NONE;
+        cgramCandidateActive = false;
     }
 }
 
+void processCgramData(uint8_t value, uint32_t now)
+{
+    if (!cgramCandidateActive ||
+        static_cast<uint32_t>(now - cgramCandidateLastUs) >
+            CGRAM_BLOCK_TIMEOUT_US ||
+        (value & 0xE0) != 0) {
+        cgramCandidateActive = false;
+        lcdAddressSpace = LCD_SPACE_NONE;
+        return;
+    }
+
+    cgramCandidateLastUs = now;
+
+    if (entryIncrement)
+        lcdCgramAddress =
+            static_cast<uint8_t>((lcdCgramAddress + 1) & 0x3F);
+    else
+        lcdCgramAddress =
+            static_cast<uint8_t>((lcdCgramAddress - 1) & 0x3F);
+}
+
+void processDdramData(uint8_t value, uint32_t now)
+{
+    const int position = addressToPosition(lcdAddress);
+
+    if (position < 0 || position >= 32) {
+        lcdAddressSpace = LCD_SPACE_NONE;
+        return;
+    }
+
+    portENTER_CRITICAL(&lcdMux);
+    if (lcdScreen[position] != value) {
+        lcdScreen[position] = value;
+        ++lcdRevision;
+        lastLcdChangeUs = now;
+    }
+    portEXIT_CRITICAL(&lcdMux);
+
+    advanceDdramAddress();
+
+    // A 16-character row cannot spill into hidden DDRAM or into the other row.
+    if (addressToPosition(lcdAddress) < 0)
+        lcdAddressSpace = LCD_SPACE_NONE;
+}
+
+void processData(uint8_t value, uint32_t now)
+{
+    if (lcdAddressSpace == LCD_SPACE_CGRAM)
+        processCgramData(value, now);
+    else if (lcdAddressSpace == LCD_SPACE_DDRAM)
+        processDdramData(value, now);
+}
+
+static inline void processCapturedNibble(
+    uint8_t nibble,
+    bool currentRs,
+    uint32_t now
+) {
+    if (lastBusTime != 0 &&
+        static_cast<uint32_t>(now - lastBusTime) > NIBBLE_TIMEOUT_US)
+        nibbleStage = 0;
+
+    if (currentRs != lastRs)
+        nibbleStage = 0;
+
+    lastRs = currentRs;
+    lastBusTime = now;
+
+    if (nibbleStage == 0) {
+        firstNibble = nibble;
+        nibbleStage = 1;
+        return;
+    }
+
+    const uint8_t value =
+        static_cast<uint8_t>((firstNibble << 4) | nibble);
+    nibbleStage = 0;
+
+    if (currentRs) processData(value, now);
+    else processCommand(value, now);
+}
+
+void copyStableScreen(uint8_t *destination, uint32_t &revision)
+{
+    const uint32_t now = micros();
+
+    portENTER_CRITICAL(&lcdMux);
+
+    if (lcdRevision != publishedRevision &&
+        static_cast<uint32_t>(now - lastLcdChangeUs) >= DISPLAY_IDLE_US) {
+        memcpy(publishedScreen, lcdScreen, sizeof(publishedScreen));
+        publishedRevision = lcdRevision;
+    }
+
+    memcpy(destination, publishedScreen, sizeof(publishedScreen));
+    revision = publishedRevision;
+
+    portEXIT_CRITICAL(&lcdMux);
+}
+
 // ============================================================================
-// ОСНОВНАЯ WEB-СТРАНИЦА
+// WEB INTERFACE
 // ============================================================================
 
 const char indexHtml[] PROGMEM = R"rawliteral(
@@ -506,15 +370,6 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     font-weight: bold;
     text-shadow: 0 0 3px #0f0;
   }
-  .lcd-glyph {
-    display: none;
-    width: 15px;
-    height: 24px;
-    opacity: .94;
-    filter: drop-shadow(0 0 1px #0f0);
-  }
-  .cell.special .lcd-char { display: none; }
-  .cell.special .lcd-glyph { display: block; }
   .grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -702,424 +557,170 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
 <script>
   const PACKET_LCD = 0xFD;
-
-  let socket = null;
-  let reconnectTimer = null;
-  let lcdRequestTimer = null;
-  let lcdRequestWatchdog = null;
-  let lcdRequestPending = false;
-  let lcdRefreshAfterRelease = false;
-  let lastSentMomentaryHeld = false;
-  let buttonMask = (1 << 3) | (1 << 8);
-  let lastCellSignatures = Array(32).fill('');
-  let specialSequenceRunning = false;
-  let activeLayout = null;
-  let lastClearGeneration = null;
-  const meterFields = new Map();
-  const INVALID_FIELD_HOLD_MS = 120;
-
-  const SPACE = 0x20;
   const MOMENTARY_MASK =
     (1 << 1) | (1 << 2) | (1 << 4) |
     (1 << 5) | (1 << 6) | (1 << 7);
-  const LCD_POLL_IDLE_MS = 20;
-  const LCD_POLL_HELD_MS = 40;
-  const blankCgram = new Uint8Array(64);
-  const meterScreen = new Uint8Array(32);
-  meterScreen.fill(SPACE);
+  const POLL_IDLE_MS = 20;
+  const POLL_HELD_MS = 50;
 
+  let socket = null;
+  let reconnectTimer = null;
+  let pollTimer = null;
+  let requestWatchdog = null;
+  let requestPending = false;
+  let buttonMask = (1 << 3) | (1 << 8);
+  let specialSequenceRunning = false;
+  const lastScreen = new Uint8Array(32).fill(0x20);
+  const lastCharacters = Array(32).fill('');
 
-  // One dot renderer for ROM text and CGRAM. No DOM/font mismatch.
-  // Original 5x7 patterns with an eighth blank row; not a dump of chip CGROM.
-  const FONT_HEX = {
-    ' ':'00000000000000', '!':'04040404040004', '"':'0A0A0A00000000',
-    '#':'0A0A1F0A1F0A0A', '$':'040F140E051E04', '%':'18190204081303',
-    '&':'0C12140A15120D', "'":'04040800000000', '(':'02040808080402',
-    ')':'08040202020408', '*':'000A041F040A00', '+':'0004041F040400',
-    ',':'00000000000408', '-':'0000001F000000', '.':'00000000000004',
-    '/':'01010204081010', '0':'0E11131519110E', '1':'040C040404040E',
-    '2':'0E11010204081F', '3':'1F01020601110E', '4':'02060A121F0202',
-    '5':'1F101E0101110E', '6':'0608101E11110E', '7':'1F010204080808',
-    '8':'0E11110E11110E', '9':'0E11110F01020C', ':':'00040400040400',
-    ';':'00040400040408', '<':'02040810080402', '=':'00001F001F0000',
-    '>':'08040201020408', '?':'0E110102040004', '@':'0E11171517100E',
-    'A':'0E1111111F1111', 'B':'1E11111E11111E', 'C':'0E11101010110E',
-    'D':'1E11111111111E', 'E':'1F10101E10101F', 'F':'1F10101E101010',
-    'G':'0E11101711110F', 'H':'1111111F111111', 'I':'0E04040404040E',
-    'J':'0702020202120C', 'K':'11121418141211', 'L':'1010101010101F',
-    'M':'111B1515111111', 'N':'11191513111111', 'O':'0E11111111110E',
-    'P':'1E11111E101010', 'Q':'0E11111115120D', 'R':'1E11111E141211',
-    'S':'0F10100E01011E', 'T':'1F040404040404', 'U':'1111111111110E',
-    'V':'11111111110A04', 'W':'11111115151B11', 'X':'11110A040A1111',
-    'Y':'11110A04040404', 'Z':'1F01020408101F', '[':'0E08080808080E',
-    '\\':'10100804020101', ']':'0E02020202020E', '^':'040A1100000000',
-    '_':'0000000000001F', '`':'08040200000000', 'a':'00000E010F110F',
-    'b':'1010161911111E', 'c':'00000E1110110E', 'd':'01010D1311110F',
-    'e':'00000E111F100E', 'f':'0609091C080808', 'g':'00000F11110F01',
-    'h':'10101619111111', 'i':'04000C0404040E', 'j':'0200060202120C',
-    'k':'10101214181412', 'l':'0C04040404040E', 'm':'00001A15151515',
-    'n':'00001619111111', 'o':'00000E1111110E', 'p':'00001E11111E10',
-    'q':'00000F11110F01', 'r':'00001619101010', 's':'00000F100E011E',
-    't':'08081C08080906', 'u':'0000111111130D', 'v':'00001111110A04',
-    'w':'0000111115150A', 'x':'0000110A040A11', 'y':'00001111110F01',
-    'z':'00001F0204081F', '{':'02040408040402', '|':'04040404040404',
-    '}':'08040402040408', '~':'00000815020000'
-  };
-  const FONT_ROWS = new Map(Object.entries(FONT_HEX).map(([character, hex]) => {
-    const pixels = new Uint8Array(8);
-    for (let row = 0; row < 7; row++) pixels[row] = parseInt(hex.slice(row*2, row*2+2), 16);
-    return [character.charCodeAt(0), pixels];
-  }));
-  FONT_ROWS.set(0xE4, new Uint8Array([0,0,17,17,19,29,16,16])); // micro sign
-  FONT_ROWS.set(0xDF, new Uint8Array([6,9,9,6,0,0,0,0]));       // degree
-  FONT_ROWS.set(0x7E, new Uint8Array([0,4,2,31,2,4,0,0]));
-  FONT_ROWS.set(0x7F, new Uint8Array([0,4,8,31,8,4,0,0]));
-  const fullGlyph = new Uint8Array(8).fill(31);
-  const emptyGlyph = new Uint8Array(8);
-  const contexts = [];
+  const rows = [
+    document.getElementById('row1'),
+    document.getElementById('row2')
+  ];
 
-  const rows = [document.getElementById('row1'), document.getElementById('row2')];
   for (let i = 0; i < 32; i++) {
     const cell = document.createElement('div');
-    const canvas = document.createElement('canvas');
-    cell.className = 'cell special';
-    canvas.className = 'lcd-glyph';
-    canvas.width = 30;
-    canvas.height = 48;
-    cell.appendChild(canvas);
+    cell.className = 'cell';
     rows[i < 16 ? 0 : 1].appendChild(cell);
-    contexts.push(canvas.getContext('2d'));
   }
 
-  function blankScreen() { return new Uint8Array(32).fill(SPACE); }
-  function asciiScreen(row1, row2) {
-    return Uint8Array.from(
-      row1.padEnd(16,' ').slice(0,16) + row2.padEnd(16,' ').slice(0,16),
-      character => character.charCodeAt(0)
-    );
-  }
-  const powerOffScreen = asciiScreen('   POWER OFF', '');
-  const fixMeterLayout = !new URLSearchParams(location.search).has('raw');
-
-  function renderCell(index, value, cgram, fullBlocks = false) {
-    const pixels = value === 0xFF || (fullBlocks && (value & 0xF7) === 0)
-      ? fullGlyph
-      : value < 16 ? cgram.subarray((value & 7)*8, (value & 7)*8+8)
-      : FONT_ROWS.get(value) || emptyGlyph;
-    const signature = Array.from(pixels, row => row & 31).join(',');
-    if (lastCellSignatures[index] === signature) return;
-    lastCellSignatures[index] = signature;
-    const context = contexts[index];
-    context.clearRect(0,0,30,48);
-    context.fillStyle = '#4e4';
-    context.shadowColor = '#0f0';
-    context.shadowBlur = 1.4;
-    for (let row = 0; row < 8; row++)
-      for (let col = 0; col < 5; col++)
-        if (pixels[row] & (1 << (4-col)))
-          context.fillRect(col*6+0.8, row*6+0.8, 4.4, 4.4);
+  function characterFor(value) {
+    if (value <= 0x07) return '\u00a0';
+    if (value === 0xE4) return '\u00b5';
+    if (value >= 0x20 && value <= 0x7E)
+      return String.fromCharCode(value);
+    return '\u00a0';
   }
 
-  function drawScreen(screen, cgram = blankCgram, fullBlocks = false) {
-    for (let i = 0; i < 32; i++) renderCell(i, screen[i], cgram, fullBlocks);
-  }
+  function renderBytes(bytes) {
+    for (let i = 0; i < 32; i++) lastScreen[i] = bytes[i];
 
-  function writeAscii(screen, offset, text) {
-    for (let i = 0; i < text.length; i++) screen[offset+i] = text.charCodeAt(i);
-  }
-  function bytesToAscii(screen, start, end) {
-    return Array.from(screen.subarray(start,end),
-      value => value >= 32 && value <= 126 ? String.fromCharCode(value) : '\x01').join('');
-  }
-  function findAscii(screen, start, end, text) {
-    const index = bytesToAscii(screen,start,end).indexOf(text);
-    return index < 0 ? -1 : start+index;
-  }
-  function numericTokens(screen, start, end) {
-    const expression = /[0-9][.,\/][0-9]|[0-9]{1,3}/g;
-    const result = [];
-    let match;
-    while ((match = expression.exec(bytesToAscii(screen,start,end))) !== null)
-      result.push({value:match[0], offset:start+match.index});
-    return result;
-  }
-  function extractFrequency(screen) {
-    const anchor = findAscii(screen,0,16,'MHz');
-    if (anchor < 0) return null;
-    const match = bytesToAscii(screen,Math.max(0,anchor-6),anchor)
-      .match(/[ 0-9]{1,2}[.,][0-9]{3}$/);
-    return match ? match[0].padStart(6,' ').slice(-6) : null;
-  }
-  function extractValueAfter(screen, anchor) {
-    if (anchor < 0 || anchor+7 > screen.length) return null;
-    const value = bytesToAscii(screen,anchor+4,anchor+7);
-    return /^(?:[0-9][.,\/][0-9]|[ 0-9]{3})$/.test(value) && /[0-9]/.test(value)
-      ? value : null;
-  }
-  function countBarCells(screen) {
-    let count = 0;
-    for (let i = 16; i < 29; i++) if (screen[i] < 16 || screen[i] === 0x3D) count++;
-    return count;
-  }
-
-  function resetMeterState() {
-    activeLayout = null;
-    meterFields.clear();
-    meterScreen.fill(SPACE);
-  }
-
-  function findMainAnchor(screen,start,end,label) {
-    const exact = findAscii(screen,start,end,label);
-    if (exact >= 0) return exact;
-
-    // Allow one damaged byte, but reject an ambiguous match.
-    let found = -1;
-    for (let offset=start;offset+label.length<=end;offset++) {
-      let equal = 0;
-      for (let i=0;i<label.length;i++)
-        if (screen[offset+i] === label.charCodeAt(i)) equal++;
-      if (equal === label.length-1) {
-        if (found >= 0) return -1;
-        found = offset;
-      }
-    }
-    return found;
-  }
-
-  function mainAnchors(screen) {
-    return {
-      mhz: findMainAnchor(screen,3,12,'MHz'),
-      fwd: findMainAnchor(screen,16,25,'FWD='),
-      ref: findMainAnchor(screen,23,32,'REF=')
-    };
-  }
-
-  function mainFrequency(screen,anchor) {
-    const row = bytesToAscii(screen,0,12);
-    if (anchor >= 0) {
-      const before = bytesToAscii(screen,Math.max(0,anchor-6),anchor);
-      const exact = before.match(/[ 0-9]{1,2}[.,][0-9]{3}$/);
-      if (exact) return exact[0].padStart(6,' ').slice(-6);
-    }
-    const fallback = row.match(/[ 0-9]{1,2}[.,][0-9]{3}/);
-    return fallback ? fallback[0].padStart(6,' ').slice(-6) : null;
-  }
-
-  function isExplicitOtherScreen(screen) {
-    let microhenry = false;
-    for (let i=0;i<15;i++)
-      if (screen[i] === 0xE4 && screen[i+1] === 0x48) microhenry = true;
-    if (microhenry || findAscii(screen,16,32,'pF') >= 0) return true;
-
-    const text = bytesToAscii(screen,0,32).replace(/\x01/g,' ');
-    return /SETUP|TARGET|AUTO TUNE|MEMORY|METER ?RANGE|POWER LEVEL|LC LIMIT|CAP |BYPASS|BEEP|STICKY|SEMI|SAVE CURRENT|VERSION|SELF TEST|RELAY TEST|WATTMETER|AUDIO|BRIDGE|COUNTER|DELETE|DEFAULT|TOTAL RESET/.test(text);
-  }
-
-  function classifyScreen(screen) {
-    const anchors = mainAnchors(screen);
-    const frequency = mainFrequency(screen,anchors.mhz);
-    const barCells = countBarCells(screen);
-
-    if (barCells >= 4 &&
-        (anchors.mhz >= 0 || activeLayout === 'bar' ||
-         (frequency && anchors.fwd < 0 && anchors.ref < 0)))
-      return 'bar';
-
-    if (isExplicitOtherScreen(screen)) return null;
-
-    const anchorCount = Object.values(anchors)
-      .filter(offset => offset >= 0).length;
-    let indicators = 0;
-    [5,7,6].forEach((slot,index) => {
-      const value = screen[9+index];
-      if (value < 16 && (value & 7) === slot) indicators++;
-    });
-
-    if (anchorCount >= 2 ||
-        (frequency && indicators >= 2) ||
-        (frequency && (anchors.fwd >= 0 || anchors.ref >= 0)))
-      return 'meter';
-
-    // Once positively recognized, the main layout survives damaged anchors.
-    // A real 0x01 or an explicit other-screen heading releases this latch.
-    if (activeLayout === 'meter') return 'meter';
-    return null;
-  }
-
-  function setMeterField(offset,length,value) {
-    const now = Date.now();
-    if (value != null) meterFields.set(offset,{value:value,at:now});
-    const cached = meterFields.get(offset);
-    const visible = value != null ? value :
-      cached && now-cached.at <= INVALID_FIELD_HOLD_MS ? cached.value : null;
-    if (visible != null)
-      writeAscii(meterScreen,offset,visible.padStart(length,' ').slice(-length));
-  }
-
-  function validNumberAt(screen,offset) {
-    const value = bytesToAscii(screen,offset,offset+3);
-    return /^(?:[0-9][.,\/][0-9]|[ 0-9]{3})$/.test(value) && /[0-9]/.test(value)
-      ? value : null;
-  }
-
-  function antennaGlyph(cgram) {
-    const result = new Uint8Array(cgram);
-    // Keep live IntelliTune row; the antenna numeral comes from ANT state.
-    result[41] = result[47] = 0;
-    result.set((buttonMask & 1) ? [7,1,7,4,7] : [2,6,2,2,7],42);
-    return result;
-  }
-
-  function drawMeterSnapshot(screen,cgram) {
-    const anchors = mainAnchors(screen);
-    meterScreen.fill(SPACE);
-
-    setMeterField(0,6,mainFrequency(screen,anchors.mhz));
-    writeAscii(meterScreen,6,'MHz');
-    meterScreen.set([5,7,6],9);
-    setMeterField(13,3,validNumberAt(screen,13));
-
-    writeAscii(meterScreen,16,'FWD=');
-    setMeterField(20,3,
-      extractValueAfter(screen,anchors.fwd) || validNumberAt(screen,20));
-
-    writeAscii(meterScreen,25,'REF=');
-    setMeterField(29,3,
-      extractValueAfter(screen,anchors.ref) || validNumberAt(screen,29));
-
-    drawScreen(meterScreen,antennaGlyph(cgram));
-  }
-
-  function drawSnapshot(data) {
-    if (data.length === 102) {
-      const clear = new DataView(data.buffer,data.byteOffset,data.byteLength)
-        .getUint32(98,true);
-      if (clear !== lastClearGeneration) {
-        resetMeterState();
-        lastClearGeneration = clear;
-      }
+    if (!(buttonMask & (1 << 8))) {
+      const off = new Uint8Array(32).fill(0x20);
+      const text = 'POWER OFF';
+      for (let i = 0; i < text.length; i++)
+        off[3 + i] = text.charCodeAt(i);
+      bytes = off;
     }
 
-    if ((buttonMask & (1 << 8)) === 0) {
-      resetMeterState();
-      drawScreen(powerOffScreen);
+    for (let i = 0; i < 32; i++) {
+      const character = characterFor(bytes[i]);
+      if (lastCharacters[i] === character) continue;
+      rows[i < 16 ? 0 : 1].children[i % 16].textContent = character;
+      lastCharacters[i] = character;
+    }
+  }
+
+  function requestLcd() {
+    pollTimer = null;
+    if (requestPending || !socket || socket.readyState !== WebSocket.OPEN)
       return;
-    }
 
-    const screen = data.subarray(1,33);
-    const cgram = data.subarray(33,97);
-
-    if (screen.every(value => value === SPACE)) {
-      resetMeterState();
-      drawScreen(screen,cgram);
-      return;
-    }
-
-    const kind = classifyScreen(screen);
-    if (kind === 'meter' && fixMeterLayout) {
-      if (activeLayout !== 'meter') meterFields.clear();
-      activeLayout = 'meter';
-      drawMeterSnapshot(screen,cgram);
-      return;
-    }
-
-    if (activeLayout === 'meter') meterFields.clear();
-    activeLayout = kind;
-    drawScreen(screen,cgram,kind === 'bar' && fixMeterLayout);
-  }
-
-  function requestLcdSnapshot() {
-    lcdRequestTimer = null;
-    if (lcdRequestPending || !socket || socket.readyState !== WebSocket.OPEN) return;
-    lcdRequestPending = true;
+    requestPending = true;
     const connection = socket;
     connection.send('L');
-    clearTimeout(lcdRequestWatchdog);
-    // A timeout closes this stream. Never add duplicate requests to it.
-    lcdRequestWatchdog = setTimeout(() => {
-      if (socket === connection && lcdRequestPending) connection.close();
-    },2000);
+
+    clearTimeout(requestWatchdog);
+    requestWatchdog = setTimeout(() => {
+      if (socket === connection && requestPending) connection.close();
+    }, 2000);
   }
 
-  function scheduleLcdSnapshotRequest() {
-    clearTimeout(lcdRequestTimer);
-    lcdRequestTimer = setTimeout(requestLcdSnapshot,
-      buttonMask & MOMENTARY_MASK ? LCD_POLL_HELD_MS : LCD_POLL_IDLE_MS);
+  function scheduleLcd(immediate) {
+    clearTimeout(pollTimer);
+    if (immediate && !requestPending) {
+      requestLcd();
+      return;
+    }
+
+    pollTimer = setTimeout(
+      requestLcd,
+      buttonMask & MOMENTARY_MASK ? POLL_HELD_MS : POLL_IDLE_MS
+    );
   }
 
   function connect() {
-    if (socket && (socket.readyState === WebSocket.OPEN ||
-                   socket.readyState === WebSocket.CONNECTING)) return;
+    if (socket &&
+        (socket.readyState === WebSocket.OPEN ||
+         socket.readyState === WebSocket.CONNECTING))
+      return;
+
     const connection = new WebSocket(
-      (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+      (location.protocol === 'https:' ? 'wss://' : 'ws://') +
+      location.host + '/ws'
+    );
+
     socket = connection;
     connection.binaryType = 'arraybuffer';
+
     connection.onopen = () => {
       if (socket !== connection) return;
       document.getElementById('status').className = 'on';
-      // The ESP sends S + its actual output mask first. Reloading the page
-      // must not overwrite ANT/AUTO/POWER with browser defaults.
     };
+
     connection.onclose = () => {
       if (socket !== connection) return;
       document.getElementById('status').className = 'off';
-      clearTimeout(lcdRequestTimer);
-      clearTimeout(lcdRequestWatchdog);
-      lcdRequestPending = lcdRefreshAfterRelease = false;
+      clearTimeout(pollTimer);
+      clearTimeout(requestWatchdog);
+      requestPending = false;
       releaseMomentaryButtons();
-      if (!reconnectTimer) reconnectTimer = setTimeout(() => {
-        reconnectTimer = null; connect();
-      },1500);
+
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, 1500);
+      }
     };
+
     connection.onerror = () => {
-      if (socket === connection) document.getElementById('status').className = 'off';
+      if (socket === connection)
+        document.getElementById('status').className = 'off';
     };
+
     connection.onmessage = event => {
       if (socket !== connection) return;
+
       if (typeof event.data === 'string') {
         if (/^S[01]{9}$/.test(event.data)) {
           buttonMask = 0;
           for (let i = 0; i < 9; i++) {
-            if (event.data[i+1] === '1') buttonMask |= 1 << i;
+            if (event.data[i + 1] === '1') buttonMask |= 1 << i;
             updateButtonVisual(i);
           }
-          lastSentMomentaryHeld = !!(buttonMask & MOMENTARY_MASK);
-          requestLcdSnapshot();
+          renderBytes(lastScreen);
+          scheduleLcd(true);
         }
         return;
       }
+
       const data = new Uint8Array(event.data);
-      if ((data.length !== 98 && data.length !== 102) || data[0] !== PACKET_LCD) return;
-      clearTimeout(lcdRequestWatchdog);
-      lcdRequestPending = false;
-      drawSnapshot(data);
-      if (lcdRefreshAfterRelease) {
-        lcdRefreshAfterRelease = false;
-        requestLcdSnapshot();
-      } else scheduleLcdSnapshotRequest();
+      if (data.length !== 37 || data[0] !== PACKET_LCD) return;
+
+      clearTimeout(requestWatchdog);
+      requestPending = false;
+      renderBytes(data.subarray(1, 33));
+      scheduleLcd(false);
     };
   }
 
   function sendButtons() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
     let message = 'B';
-    for (let i = 0; i < 9; i++) message += buttonMask & (1 << i) ? '1' : '0';
-    socket.send(message);  // Always before any LCD scheduling.
-    const held = !!(buttonMask & MOMENTARY_MASK);
-    if (lastSentMomentaryHeld && !held) {
-      lcdRefreshAfterRelease = lcdRequestPending;
-      clearTimeout(lcdRequestTimer);
-      if (!lcdRequestPending) requestLcdSnapshot();
-    } else if (held) scheduleLcdSnapshotRequest();
-    lastSentMomentaryHeld = held;
+    for (let i = 0; i < 9; i++)
+      message += buttonMask & (1 << i) ? '1' : '0';
+
+    socket.send(message);
+    scheduleLcd(true);
   }
 
   function updateButtonVisual(index) {
     const button = document.getElementById('b' + index);
-    const active = (buttonMask & (1 << index)) !== 0;
-
     if (!button) return;
 
+    const active = !!(buttonMask & (1 << index));
     button.classList.toggle('active', active);
 
     if (index === 0) button.textContent = active ? 'ANT2' : 'ANT1';
@@ -1128,97 +729,77 @@ const char indexHtml[] PROGMEM = R"rawliteral(
   }
 
   function setButton(index, active, sendNow = true) {
-    if (active) {
-      buttonMask |= 1 << index;
-    }
-    else {
-      buttonMask &= ~(1 << index);
-    }
+    if (active) buttonMask |= 1 << index;
+    else buttonMask &= ~(1 << index);
 
     updateButtonVisual(index);
-
     if (index === 8) {
-      lastCellSignatures.fill('');
-      resetMeterState();
-      lastClearGeneration = null;
-
-      if (active) {
-        drawScreen(blankScreen(), blankCgram);
-      }
-      else {
-        drawScreen(powerOffScreen, blankCgram);
-      }
+      if (active) lastScreen.fill(0x20);
+      renderBytes(lastScreen);
     }
-
     if (sendNow) sendButtons();
   }
 
   function toggleButton(index) {
-    setButton(index, (buttonMask & (1 << index)) === 0);
+    setButton(index, !(buttonMask & (1 << index)));
   }
 
   function bindMomentary(index) {
-    const button = document.getElementById('b'+index);
+    const button = document.getElementById('b' + index);
+    let pressed = false;
+
     button.addEventListener('pointerdown', event => {
       event.preventDefault();
-      if (buttonMask & (1 << index)) return;
-      if (button.setPointerCapture) button.setPointerCapture(event.pointerId);
-      setButton(index,true);
+      if (pressed) return;
+      pressed = true;
+      if (button.setPointerCapture)
+        button.setPointerCapture(event.pointerId);
+      setButton(index, true);
     });
+
     const release = event => {
-      if (!(buttonMask & (1 << index))) return;
+      if (!pressed) return;
+      pressed = false;
       if (event) event.preventDefault();
-      setButton(index,false);
+      setButton(index, false);
     };
-    ['pointerup','pointercancel','lostpointercapture'].forEach(type =>
-      button.addEventListener(type,release));
+
+    button.addEventListener('pointerup', release);
+    button.addEventListener('pointercancel', release);
+    button.addEventListener('lostpointercapture', release);
   }
 
   [1, 2, 4, 5, 6, 7].forEach(bindMomentary);
 
   document.querySelectorAll('[data-pins]').forEach(button => {
     const pins = button.dataset.pins.split(',').map(Number);
-    let active = false;
+    let pressed = false;
 
-    const release = event => {
-      if (!active) return;
-      if (event) event.preventDefault();
-
-      active = false;
-      button.classList.remove('active');
-
-      pins.forEach(index => setButton(index, false, false));
-      sendButtons();
-
-      window.removeEventListener('mouseup', release);
-      window.removeEventListener('touchend', release);
-      window.removeEventListener('touchcancel', release);
-    };
-
-    const press = event => {
+    button.addEventListener('pointerdown', event => {
       event.preventDefault();
-      if (active) return;
+      if (pressed) return;
+      if (button.dataset.confirm && !confirm(button.dataset.confirm)) return;
 
-      if (
-        button.dataset.confirm &&
-        !confirm(button.dataset.confirm)
-      ) {
-        return;
-      }
-
-      active = true;
+      pressed = true;
       button.classList.add('active');
-
+      if (button.setPointerCapture)
+        button.setPointerCapture(event.pointerId);
       pins.forEach(index => setButton(index, true, false));
       sendButtons();
+    });
 
-      window.addEventListener('mouseup', release);
-      window.addEventListener('touchend', release, {passive:false});
-      window.addEventListener('touchcancel', release, {passive:false});
+    const release = event => {
+      if (!pressed) return;
+      pressed = false;
+      if (event) event.preventDefault();
+      button.classList.remove('active');
+      pins.forEach(index => setButton(index, false, false));
+      sendButtons();
     };
 
-    button.addEventListener('mousedown', press);
-    button.addEventListener('touchstart', press, {passive:false});
+    button.addEventListener('pointerup', release);
+    button.addEventListener('pointercancel', release);
+    button.addEventListener('lostpointercapture', release);
   });
 
   const waitMs = milliseconds =>
@@ -1226,15 +807,13 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
   async function runLcLimitSequence(button) {
     if (specialSequenceRunning) return;
-
     if (!confirm(
       'LC LIMIT является защитой тюнера. Выполнить сочетание MODE, затем C-UP + L-UP?'
-    )) {
-      return;
-    }
+    )) return;
 
     specialSequenceRunning = true;
     button.classList.add('active');
+
     setButton(4, true, false);
     sendButtons();
     await waitMs(250);
@@ -1255,24 +834,13 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
   async function runPowerOnSequence(button) {
     if (specialSequenceRunning) return;
+    if (button.dataset.confirm && !confirm(button.dataset.confirm)) return;
 
-    if (
-      button.dataset.confirm &&
-      !confirm(button.dataset.confirm)
-    ) {
-      return;
-    }
-
-    const pins = button.dataset.poweronPins
-      .split(',')
-      .map(Number);
-
+    const pins = button.dataset.poweronPins.split(',').map(Number);
     specialSequenceRunning = true;
     button.classList.add('active');
     releaseMomentaryButtons();
 
-    // Руководство запрещает быстрое переключение питания: даём тюнеру
-    // полностью выключиться перед зажимом требуемых кнопок.
     setButton(8, false, false);
     sendButtons();
     await waitMs(2200);
@@ -1292,13 +860,10 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     specialSequenceRunning = false;
   }
 
-  document.getElementById('lcLimitButton').addEventListener(
-    'click',
-    event => {
-      event.preventDefault();
-      runLcLimitSequence(event.currentTarget);
-    }
-  );
+  document.getElementById('lcLimitButton').addEventListener('click', event => {
+    event.preventDefault();
+    runLcLimitSequence(event.currentTarget);
+  });
 
   document.querySelectorAll('[data-poweron-pins]').forEach(button => {
     button.addEventListener('click', event => {
@@ -1308,50 +873,41 @@ const char indexHtml[] PROGMEM = R"rawliteral(
   });
 
   function releaseMomentaryButtons() {
+    let changed = false;
+
     [1, 2, 4, 5, 6, 7].forEach(index => {
+      if (buttonMask & (1 << index)) changed = true;
       setButton(index, false, false);
     });
 
-    sendButtons();
+    if (changed) sendButtons();
   }
 
   window.addEventListener('blur', releaseMomentaryButtons);
   window.addEventListener('pagehide', releaseMomentaryButtons);
-
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      releaseMomentaryButtons();
-    }
+    if (document.hidden) releaseMomentaryButtons();
   });
 
   function checkPower() {
-    if (buttonMask & (1 << 8)) {
+    if (buttonMask & (1 << 8))
       document.getElementById('modal').style.display = 'block';
-    }
-    else {
+    else
       toggleButton(8);
-    }
   }
 
   function confirmPower(confirmed) {
     document.getElementById('modal').style.display = 'none';
-
-    if (confirmed) {
-      toggleButton(8);
-    }
+    if (confirmed) toggleButton(8);
   }
 
   [0, 3, 8].forEach(updateButtonVisual);
-
+  renderBytes(lastScreen);
   connect();
 </script>
 </body>
 </html>
 )rawliteral";
-
-// ============================================================================
-// СТРАНИЦА НАСТРОЙКИ WIFI
-// ============================================================================
 
 const char configHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1547,38 +1103,26 @@ const char updateHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
+
 // ============================================================================
-// КНОПКИ
+// BUTTON OUTPUTS
 // ============================================================================
 
 void applyButtonMask(uint16_t newMask)
 {
     newMask &= 0x01FF;
 
-    bool powerWasOn =
-        (buttonMask & (1U << 8)) != 0;
+    const bool powerWasOn = (buttonMask & (1U << 8)) != 0;
+    const bool powerWillBeOn = (newMask & (1U << 8)) != 0;
 
-    bool powerWillBeOn =
-        (newMask & (1U << 8)) != 0;
-
-    if (!powerWasOn && powerWillBeOn) {
-        resetCapturedLcd(true);
-    }
+    if (!powerWasOn && powerWillBeOn)
+        requestCaptureReset(true);
 
     for (uint8_t i = 0; i < 9; i++) {
-        bool logicalState =
-            (newMask & (1U << i)) != 0;
-
-        // POWER (GPIO32) подключён с обратной полярностью.
-        // В протоколе и интерфейсе 1 означает POWER ON,
-        // а на физический выход подаётся обратный уровень.
-        bool outputLevel =
-            (i == 8) ? !logicalState : logicalState;
-
-        digitalWrite(
-            BTN_PINS[i],
-            outputLevel ? HIGH : LOW
-        );
+        const bool logicalState = (newMask & (1U << i)) != 0;
+        const bool outputLevel = (i == 8) ? !logicalState : logicalState;
+        digitalWrite(BTN_PINS[i], outputLevel ? HIGH : LOW);
     }
 
     buttonMask = newMask;
@@ -1586,10 +1130,7 @@ void applyButtonMask(uint16_t newMask)
 
 void releaseMomentaryButtons()
 {
-    uint16_t newMask =
-        buttonMask & ~MOMENTARY_BUTTON_MASK;
-
-    applyButtonMask(newMask);
+    applyButtonMask(buttonMask & ~MOMENTARY_BUTTON_MASK);
 }
 
 // ============================================================================
@@ -1599,24 +1140,30 @@ void releaseMomentaryButtons()
 void sendLcdSnapshot(AsyncWebSocketClient *client)
 {
     if (!client || !client->canSend()) return;
-    uint8_t packet[102];
+
+    uint8_t packet[37];
+    uint32_t revision = 0;
     packet[0] = 0xFD;
-    // This lock protects the model on core 0 only. The acquisition producer
-    // never takes it, even while all 96 bytes are copied here.
-    portENTER_CRITICAL(&lcdMux);
-    lcd.snapshot(&packet[1], &packet[33]);
-    packet[97] = lcd.revision();
-    const uint32_t clear = lcd.clearGeneration();
-    for (unsigned i = 0; i < 4; ++i) packet[98 + i] = (clear >> (8 * i)) & 0xFF;
-    portEXIT_CRITICAL(&lcdMux);
+    copyStableScreen(&packet[1], revision);
+
+    packet[33] = revision & 0xFF;
+    packet[34] = (revision >> 8) & 0xFF;
+    packet[35] = (revision >> 16) & 0xFF;
+    packet[36] = (revision >> 24) & 0xFF;
+
     client->binary(packet, sizeof(packet));
 }
 
 void sendButtonState(AsyncWebSocketClient *client)
 {
+    if (!client || !client->canSend()) return;
+
     char state[11] = "S000000000";
     const uint16_t mask = buttonMask;
-    for (unsigned i = 0; i < 9; ++i) state[i + 1] = mask & (1U << i) ? '1' : '0';
+
+    for (uint8_t i = 0; i < 9; i++)
+        state[i + 1] = mask & (1U << i) ? '1' : '0';
+
     client->text(state, 10);
 }
 
@@ -1638,199 +1185,119 @@ void handleWebSocketEvent(
         return;
     }
 
-    if (type != WS_EVT_DATA) {
+    if (type != WS_EVT_DATA) return;
+
+    AwsFrameInfo *info = static_cast<AwsFrameInfo *>(arg);
+
+    if (!info || !info->final || info->index != 0 ||
+        info->len != length || info->opcode != WS_TEXT)
         return;
-    }
 
-    AwsFrameInfo *info =
-        static_cast<AwsFrameInfo *>(arg);
-
-    if (
-        info == nullptr ||
-        !info->final ||
-        info->index != 0 ||
-        info->len != length ||
-        info->opcode != WS_TEXT
-    ) {
-        return;
-    }
-
-    if (
-        length == 1 &&
-        data[0] == 'L' &&
-        !webUpdateInProgress
-    ) {
+    if (length == 1 && data[0] == 'L' && !webUpdateInProgress) {
         sendLcdSnapshot(client);
         return;
     }
 
-    if (
-        length == 10 &&
-        data[0] == 'B' &&
-        !webUpdateInProgress
-    ) {
-        uint16_t newMask = 0;
+    if (length != 10 || data[0] != 'B' || webUpdateInProgress)
+        return;
 
-        for (uint8_t i = 0; i < 9; i++) {
-            if (data[i + 1] == '1') {
-                newMask |= 1U << i;
-            }
-            else if (data[i + 1] != '0') {
-                return;
-            }
-        }
+    uint16_t newMask = 0;
 
-        applyButtonMask(newMask);
+    for (uint8_t i = 0; i < 9; i++) {
+        if (data[i + 1] == '1')
+            newMask |= 1U << i;
+        else if (data[i + 1] != '0')
+            return;
     }
+
+    applyButtonMask(newMask);
 }
 
 // ============================================================================
-// WEB-ЗАДАЧА — ЯДРО 0
+// HTTP AND WIFI — CORE 0
 // ============================================================================
 
-void TaskWeb(void *parameter)
+void addNoCacheHeaders(AsyncWebServerResponse *response)
 {
-    uint32_t lastCleanupMs = 0;
-
-    for (;;) {
-        drainCapturedLcd();
-        uint32_t now = millis();
-
-        if (
-            webUpdateRestartPending &&
-            (int32_t)(now - webUpdateRestartAtMs) >= 0
-        ) {
-            ESP.restart();
-        }
-
-        if (
-            webUpdateInProgress &&
-            (uint32_t)(now - webUpdateLastActivityMs) >= 60000
-        ) {
-            Update.abort();
-            webUpdateFailed = true;
-            webUpdateInProgress = false;
-            Serial.println("HTTP update aborted: timeout");
-        }
-
-        if ((uint32_t)(now - lastCleanupMs) >= 5000) {
-            lastCleanupMs = now;
-            ws.cleanupClients();
-        }
-
-        vTaskDelay(1);
-    }
+    response->addHeader(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, max-age=0"
+    );
+    response->addHeader("Pragma", "no-cache");
+    response->addHeader("Expires", "0");
 }
 
-// ============================================================================
-// SETUP
-// ============================================================================
+void rememberUpdateError(const char *stage)
+{
+    snprintf(
+        webUpdateError,
+        sizeof(webUpdateError),
+        "%s: %s",
+        stage,
+        Update.errorString()
+    );
+}
 
-void TaskNetworkSetup(void *parameter)
+void TaskNetwork(void *parameter)
 {
     prefs.begin("wifi", false);
 
-    String savedSsid = prefs.getString("s", "");
-    String savedPassword = prefs.getString("p", "");
+    const String savedSsid = prefs.getString("s", "");
+    const String savedPassword = prefs.getString("p", "");
+
+    bool stationConnected = false;
 
     if (savedSsid.length() > 0) {
         WiFi.mode(WIFI_STA);
         WiFi.setSleep(false);
+        WiFi.setHostname("mfj993b-remote");
         WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+
+        for (uint8_t attempt = 0;
+             attempt < 20 && WiFi.status() != WL_CONNECTED;
+             attempt++)
+            vTaskDelay(pdMS_TO_TICKS(500));
+
+        stationConnected = WiFi.status() == WL_CONNECTED;
     }
 
-    int attempts = 0;
-
-    while (
-        WiFi.status() != WL_CONNECTED &&
-        attempts < 20
-    ) {
-        delay(500);
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-    }
-    else {
+    if (!stationConnected) {
         WiFi.mode(WIFI_AP);
         WiFi.softAP("MFJ993b-CONFIG", "12345678");
-
-        Serial.print("Config AP: ");
-        Serial.println(WiFi.softAPIP());
     }
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        const char *page =
-            (WiFi.status() == WL_CONNECTED)
-                ? indexHtml
-                : configHtml;
-
-        AsyncWebServerResponse *response =
-            request->beginResponse_P(
-                200,
-                "text/html; charset=utf-8",
-                page
-            );
-
-        response->addHeader(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0"
+    server.on("/", HTTP_GET, [stationConnected](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse_P(
+            200,
+            "text/html; charset=utf-8",
+            stationConnected ? indexHtml : configHtml
         );
-        response->addHeader("Pragma", "no-cache");
-        response->addHeader("Expires", "0");
-
+        addNoCacheHeaders(response);
         request->send(response);
     });
 
     server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (
-            !request->hasParam("s", true) ||
-            !request->hasParam("p", true)
-        ) {
-            request->send(
-                400,
-                "text/plain",
-                "SSID or password missing"
-            );
+        if (!request->hasParam("s", true) ||
+            !request->hasParam("p", true)) {
+            request->send(400, "text/plain", "SSID or password missing");
             return;
         }
 
-        String ssid =
-            request->getParam("s", true)->value();
-
-        String password =
-            request->getParam("p", true)->value();
-
-        prefs.putString("s", ssid);
-        prefs.putString("p", password);
-
-        request->send(
-            200,
-            "text/plain",
-            "SAVED. RESTARTING..."
-        );
+        prefs.putString("s", request->getParam("s", true)->value());
+        prefs.putString("p", request->getParam("p", true)->value());
+        request->send(200, "text/plain", "SAVED. RESTARTING...");
 
         webUpdateRestartAtMs = millis() + 500;
         webUpdateRestartPending = true;
     });
 
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response =
-            request->beginResponse_P(
-                200,
-                "text/html; charset=utf-8",
-                updateHtml
-            );
-
-        response->addHeader(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0"
+        AsyncWebServerResponse *response = request->beginResponse_P(
+            200,
+            "text/html; charset=utf-8",
+            updateHtml
         );
-        response->addHeader("Pragma", "no-cache");
-        response->addHeader("Expires", "0");
-
+        addNoCacheHeaders(response);
         request->send(response);
     });
 
@@ -1838,27 +1305,36 @@ void TaskNetworkSetup(void *parameter)
         "/update",
         HTTP_POST,
         [](AsyncWebServerRequest *request) {
-            bool success =
+            const bool success =
                 webUpdateSucceeded &&
                 !webUpdateFailed &&
                 !Update.hasError();
 
-            AsyncWebServerResponse *response =
-                request->beginResponse(
-                    success ? 200 : 500,
-                    "text/plain; charset=utf-8",
-                    success
-                        ? "OK. RESTARTING..."
-                        : "UPDATE FAILED"
-                );
+            String message;
 
+            if (success) {
+                message = "OK. RESTARTING...";
+            }
+            else {
+                message = "UPDATE FAILED: ";
+                message += webUpdateError[0]
+                    ? webUpdateError
+                    : Update.errorString();
+            }
+
+            AsyncWebServerResponse *response = request->beginResponse(
+                success ? 200 : 500,
+                "text/plain; charset=utf-8",
+                message
+            );
             response->addHeader("Connection", "close");
             request->send(response);
 
             webUpdateInProgress = false;
+            requestCaptureReset(false);
 
             if (success) {
-                webUpdateRestartAtMs = millis() + 2000;
+                webUpdateRestartAtMs = millis() + 1500;
                 webUpdateRestartPending = true;
             }
         },
@@ -1874,52 +1350,48 @@ void TaskNetworkSetup(void *parameter)
                 webUpdateRestartPending = false;
                 webUpdateLastActivityMs = millis();
                 webUpdateInProgress = true;
+                webUpdateError[0] = '\0';
 
                 releaseMomentaryButtons();
+                requestCaptureReset(false);
 
-                resetCapturedLcd(false);
+                String lowerName = filename;
+                lowerName.toLowerCase();
 
-                Serial.printf(
-                    "HTTP update: %s\n",
-                    filename.c_str()
-                );
-
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                if (!lowerName.endsWith(".ino.bin")) {
                     webUpdateFailed = true;
-                    Update.printError(Serial);
+                    snprintf(
+                        webUpdateError,
+                        sizeof(webUpdateError),
+                        "select the application *.ino.bin file"
+                    );
+                }
+                else if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+                    webUpdateFailed = true;
+                    rememberUpdateError("begin");
                 }
             }
 
-            if (
-                !webUpdateFailed &&
-                length > 0 &&
-                Update.write(data, length) != length
-            ) {
-                webUpdateFailed = true;
-                Update.printError(Serial);
-            }
-
-            if (length > 0) {
+            if (length > 0)
                 webUpdateLastActivityMs = millis();
+
+            if (!webUpdateFailed && length > 0 &&
+                Update.write(data, length) != length) {
+                webUpdateFailed = true;
+                rememberUpdateError("write");
             }
 
             if (final) {
                 if (!webUpdateFailed) {
-                    if (Update.end(true)) {
+                    if (Update.end(true))
                         webUpdateSucceeded = true;
-
-                        Serial.printf(
-                            "HTTP update complete: %u bytes\n",
-                            (unsigned int)(index + length)
-                        );
-                    }
                     else {
                         webUpdateFailed = true;
-                        Update.printError(Serial);
+                        rememberUpdateError("finish");
                     }
                 }
                 else {
-                    Update.end();
+                    Update.abort();
                 }
             }
         }
@@ -1929,25 +1401,61 @@ void TaskNetworkSetup(void *parameter)
     server.addHandler(&ws);
     server.begin();
 
-    Serial.println("LCD capture: SAMPLE_DELAY=110, capture=s1");
-    Serial.println("LCD mirror: raw SPSC capture, live model, no frame-matching gates");
-    Serial.println("Nibble sync: reset incomplete byte only");
-    vTaskDelete(nullptr);
+    uint32_t lastCleanupMs = 0;
+
+    for (;;) {
+        const uint32_t now = millis();
+
+        if (webUpdateRestartPending &&
+            static_cast<int32_t>(now - webUpdateRestartAtMs) >= 0)
+            ESP.restart();
+
+        if (webUpdateInProgress &&
+            static_cast<uint32_t>(now - webUpdateLastActivityMs) >= 300000) {
+            Update.abort();
+            webUpdateFailed = true;
+            snprintf(
+                webUpdateError,
+                sizeof(webUpdateError),
+                "timeout while receiving the file"
+            );
+            webUpdateInProgress = false;
+            requestCaptureReset(false);
+        }
+
+        if (static_cast<uint32_t>(now - lastCleanupMs) >= 5000) {
+            lastCleanupMs = now;
+            ws.cleanupClients();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
 }
 
+// ============================================================================
+// STARTUP
+// ============================================================================
 
 void setup()
 {
-    Serial.begin(460800);
     setCpuFrequencyMhz(240);
 
-    resetCapturedLcd(true);
+    memset(lcdScreen, ' ', sizeof(lcdScreen));
+    memset(publishedScreen, ' ', sizeof(publishedScreen));
+    lastLcdChangeUs = micros();
+    resetDecoder();
 
     for (uint8_t i = 0; i < 9; i++) {
+        const bool logicalState =
+            (INITIAL_BUTTON_MASK & (1U << i)) != 0;
+        const bool outputLevel =
+            (i == 8) ? !logicalState : logicalState;
+
+        digitalWrite(BTN_PINS[i], outputLevel ? HIGH : LOW);
         pinMode(BTN_PINS[i], OUTPUT);
     }
 
-    applyButtonMask(INITIAL_BUTTON_MASK);
+    buttonMask = INITIAL_BUTTON_MASK;
 
     pinMode(PIN_E, INPUT_PULLDOWN);
     pinMode(PIN_RS, INPUT);
@@ -1956,78 +1464,57 @@ void setup()
     pinMode(PIN_DB6, INPUT);
     pinMode(PIN_DB7, INPUT);
 
-    // Capture starts as soon as setup returns, before WiFi waits for a link.
-    // Decode and network initialization run independently on core 0.
-    const BaseType_t modelTaskCreated = xTaskCreatePinnedToCore(
-        TaskWeb, "LCD model", 6144, nullptr, 2, nullptr, 0);
     const BaseType_t networkTaskCreated = xTaskCreatePinnedToCore(
-        TaskNetworkSetup, "Network startup", 8192, nullptr, 1, nullptr, 0);
-    configASSERT(modelTaskCreated == pdPASS && networkTaskCreated == pdPASS);
+        TaskNetwork,
+        "Network",
+        8192,
+        nullptr,
+        1,
+        nullptr,
+        0
+    );
+
+    configASSERT(networkTaskCreated == pdPASS);
 }
 
 // ============================================================================
-// ЗАХВАТ LCD — ЯДРО 1
+// LCD CAPTURE — CORE 1, COPIED FROM THE SUCCESSFUL TERMINAL METHOD
 // ============================================================================
-
-static inline uint8_t readNibble(uint32_t reg)
-{
-    return ((reg & MASK_DB4) ? 1 : 0) |
-           ((reg & MASK_DB5) ? 2 : 0) |
-           ((reg & MASK_DB6) ? 4 : 0) |
-           ((reg & MASK_DB7) ? 8 : 0);
-}
 
 void loop()
 {
-    static uint32_t lastPulseCycles = 0;
-    static bool gapPending = true, lossPending = false, stuckEnable = false;
+    if (__atomic_exchange_n(
+            &captureResetRequested,
+            false,
+            __ATOMIC_ACQ_REL))
+        resetDecoder();
 
     if (webUpdateInProgress || webUpdateRestartPending) {
-        gapPending = true;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(2));
         return;
     }
 
-    const uint32_t bus = REG_READ(GPIO_IN_REG);
-    if (!(bus & MASK_E)) {
-        stuckEnable = false;
-        if (!gapPending &&
-            static_cast<uint32_t>(xthal_get_ccount() - lastPulseCycles) >
-                NIBBLE_TIMEOUT_CYCLES)
-            gapPending = true;
+    if (!(REG_READ(GPIO_IN_REG) & MASK_E))
         return;
-    }
-    if (stuckEnable) return;
 
     const uint32_t start = xthal_get_ccount();
-    while (static_cast<uint32_t>(xthal_get_ccount() - start) < SAMPLE_DELAY) {
-        // Preserve the tested sample point. No queue, decoding or lock here.
+
+    while (static_cast<uint32_t>(
+               xthal_get_ccount() - start) < SAMPLE_DELAY) {
+        // Timing-critical: keep this loop empty.
     }
-    const uint32_t sampledBus = REG_READ(GPIO_IN_REG);  // s1, never s1 & s2
+
+    const uint32_t sample1 = REG_READ(GPIO_IN_REG);
+    const uint32_t sample2 = REG_READ(GPIO_IN_REG);
+    (void)sample2;
 
     while (REG_READ(GPIO_IN_REG) & MASK_E) {
-        if (static_cast<uint32_t>(xthal_get_ccount() - start) > ENABLE_STUCK_CYCLES) {
-            stuckEnable = lossPending = true;
-            return;  // A stuck E cannot freeze HTTP or fabricate repeated bytes.
-        }
+        // Process each E pulse exactly once, after the falling edge.
     }
 
-    // Also detect a gap if this core was preempted for the whole idle period.
-    // This runs after sampling, so the tested 110-cycle point is unchanged.
-    if (lastPulseCycles != 0 &&
-        static_cast<uint32_t>(start - lastPulseCycles) > NIBBLE_TIMEOUT_CYCLES)
-        gapPending = true;
-
-    uint8_t flags = readNibble(sampledBus);
-    if (sampledBus & MASK_RS) flags |= SAMPLE_RS;
-    if (gapPending) flags |= SAMPLE_GAP;
-    if (lossPending) flags |= SAMPLE_LOSS;
-
-    const uint32_t epoch = __atomic_load_n(&captureEpoch, __ATOMIC_ACQUIRE);
-    const CaptureSample sample = {start, (epoch << 8) | flags};
-    if (captureRing.push(sample)) lossPending = false;
-    else { lossPending = true; ++droppedNibbles; }
-
-    lastPulseCycles = start;
-    gapPending = false;
+    processCapturedNibble(
+        readNibble(sample1),
+        (sample1 & MASK_RS) != 0,
+        micros()
+    );
 }
