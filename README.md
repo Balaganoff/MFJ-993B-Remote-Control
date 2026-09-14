@@ -1,3 +1,5 @@
+> Experimental live-mirror branch / Экспериментальная ветка живой копии LCD: [implementation, limitations and upload instructions / реализация, ограничения и прошивка](docs/live-mirror-experiment.md). Existing main/release binaries are not this experiment / Бинарники main/релиза не относятся к этому варианту.
+
 # MFJ-993B Remote Control
 
 Unofficial ESP32-based LAN remote control and browser LCD mirror for the MFJ-993B IntelliTuner.
