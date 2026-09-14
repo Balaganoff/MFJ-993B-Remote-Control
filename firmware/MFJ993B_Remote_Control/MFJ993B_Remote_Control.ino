@@ -1,4 +1,4 @@
-// MFJ-993B Remote Control — row anchors and explicit clear tracking, 2026-09-14
+// MFJ-993B Remote Control — strict original-style row capture, 2026-09-14
 // Classic dual-core ESP32 only. Hardware pins and HTTP uploader are preserved.
 #include <Arduino.h>
 #include <WiFi.h>
@@ -81,7 +81,6 @@ class LcdModel {
 public:
     enum Space : uint8_t { Unknown, Ddram, Cgram };
 
-    // Generic HD44780 remains available to tests; MFJ uses fixed row addressing.
     explicit LcdModel(bool fixedRows = false) : fixedRows_(fixedRows) {}
 
     void reset() {
@@ -98,16 +97,20 @@ public:
     void loseAddress() { space_ = Unknown; }
 
     void write(uint8_t value, bool data) {
-        if (!data) { command(value); return; }
+        if (fixedRows_) {
+            writeFixed(value,data);
+            return;
+        }
+
+        if (!data) {
+            commandGeneric(value);
+            return;
+        }
+
         if (space_ == Cgram) {
-            // Only five low bits drive pixels. Upper bits are don't-care.
-            const uint8_t pixels = value & 0x1F;
-            if (cgram_[address_] != pixels) {
-                cgram_[address_] = pixels;
-                ++revision_;
-            }
-            address_ = (address_ + (increment_ ? 1 : 63)) & 0x3F;
-        } else if (space_ == Ddram) {
+            writeCgram(value);
+        }
+        else if (space_ == Ddram) {
             const int index = ddramIndex(address_);
             if (index >= 0 && ddram_[index] != value) {
                 ddram_[index] = value;
@@ -119,13 +122,15 @@ public:
     }
 
     void snapshot(uint8_t *screen, uint8_t *cgram) const {
-        for (unsigned row = 0; row < 2; ++row) {
-            for (unsigned col = 0; col < 16; ++col) {
-                screen[row * 16 + col] = displayOn_
-                    ? ddram_[row * 40 + ((fixedRows_ ? 0 : shift_) + col) % 40] : ' ';
+        for (unsigned row=0;row<2;row++) {
+            for (unsigned column=0;column<16;column++) {
+                const unsigned offset = fixedRows_ ? 0 : shift_;
+                screen[row*16+column] = displayOn_
+                    ? ddram_[row*40+(offset+column)%40]
+                    : ' ';
             }
         }
-        memcpy(cgram, cgram_, sizeof(cgram_));
+        memcpy(cgram,cgram_,sizeof(cgram_));
     }
 
     uint8_t revision() const { return static_cast<uint8_t>(revision_); }
@@ -134,86 +139,176 @@ public:
 private:
     uint8_t ddram_[80] = {};
     uint8_t cgram_[64] = {};
-    uint8_t address_ = 0, shift_ = 0;
+    uint8_t address_ = 0;
+    uint8_t shift_ = 0;
     Space space_ = Unknown;
-    bool increment_ = true, entryShift_ = false, displayOn_ = true;
+    bool increment_ = true;
+    bool entryShift_ = false;
+    bool displayOn_ = true;
     uint32_t revision_ = 0;
     uint32_t clearGeneration_ = 0;
     bool fixedRows_ = false;
 
     static int ddramIndex(uint8_t address) {
         if (address <= 0x27) return address;
-        if (address >= 0x40 && address <= 0x67) return 40 + address - 0x40;
+        if (address >= 0x40 && address <= 0x67)
+            return 40+address-0x40;
         return -1;
+    }
+
+    void clearDisplay() {
+        memset(ddram_,' ',sizeof(ddram_));
+        address_ = shift_ = 0;
+        increment_ = true;
+        entryShift_ = false;
+        displayOn_ = true;
+        space_ = Ddram;
+        ++revision_;
+        ++clearGeneration_;
+    }
+
+    void selectFixedRow(uint8_t address) {
+        address_ = address;
+        shift_ = 0;
+        increment_ = true;
+        entryShift_ = false;
+        displayOn_ = true;
+        space_ = Ddram;
+    }
+
+    void writeCgram(uint8_t value) {
+        // Captured PIC writes use only five pixel bits. ASCII here means that
+        // a DDRAM-address command was missed; do not turn text into a glyph.
+        if (fixedRows_ && (value & 0xE0)) {
+            space_ = Unknown;
+            return;
+        }
+
+        const uint8_t pixels = value & 0x1F;
+        if (cgram_[address_ & 0x3F] != pixels) {
+            cgram_[address_ & 0x3F] = pixels;
+            ++revision_;
+        }
+        address_ = static_cast<uint8_t>((address_+1)&0x3F);
+    }
+
+    void writeFixed(uint8_t value, bool data) {
+        if (!data) {
+            commandFixed(value);
+            return;
+        }
+
+        if (space_ == Cgram) {
+            writeCgram(value);
+            return;
+        }
+
+        if (space_ != Ddram) return;
+
+        const bool firstRow = address_ <= 0x0F;
+        const bool secondRow = address_ >= 0x40 && address_ <= 0x4F;
+        if (!firstRow && !secondRow) {
+            space_ = Unknown;
+            return;
+        }
+
+        const int index = ddramIndex(address_);
+        if (ddram_[index] != value) {
+            ddram_[index] = value;
+            ++revision_;
+        }
+
+        // A line can never spill into hidden DDRAM or into the other line.
+        if (address_ == 0x0F || address_ == 0x4F)
+            space_ = Unknown;
+        else
+            ++address_;
+    }
+
+    void commandFixed(uint8_t value) {
+        // This deliberately follows the successful original parser:
+        // clear, absolute beginning of line 1, absolute beginning of line 2.
+        if (value == 0x01) {
+            clearDisplay();
+        }
+        else if (value == 0x02 || value == 0x03) {
+            selectFixedRow(0x00);
+        }
+        else if (value == 0x80) {
+            selectFixedRow(0x00);
+        }
+        else if (value == 0xC0) {
+            selectFixedRow(0x40);
+        }
+        else if ((value & 0xC0) == 0x40) {
+            address_ = value & 0x3F;
+            increment_ = true;
+            space_ = Cgram;
+        }
+        else if (value & 0x80) {
+            // Do not trust 0x81..0xBF or 0xC1..0xFF as a text position.
+            // If a row anchor was damaged, discard its data until 0x80/0xC0.
+            space_ = Unknown;
+        }
+        // Function, entry, cursor/display-shift and display-control commands
+        // are intentionally ignored: the original mirror did not let them
+        // displace the two visible rows.
     }
 
     void advance(bool forward) {
         if (forward) {
             address_ = address_ == 0x27 ? 0x40
                      : address_ == 0x67 ? 0x00
-                     : (address_ + 1) & 0x7F;
-        } else {
+                     : static_cast<uint8_t>((address_+1)&0x7F);
+        }
+        else {
             address_ = address_ == 0x00 ? 0x67
                      : address_ == 0x40 ? 0x27
-                     : (address_ - 1) & 0x7F;
+                     : static_cast<uint8_t>((address_-1)&0x7F);
         }
     }
 
     void shiftDisplay(bool left) {
-        shift_ = (shift_ + (left ? 1 : 39)) % 40;
+        shift_ = static_cast<uint8_t>((shift_+(left ? 1 : 39))%40);
         ++revision_;
     }
 
-    void command(uint8_t value) {
-        // These are the same three hard anchors used by the original sketch.
-        // Row starts reposition the cursor; they never erase an unwritten row.
-        if (value == 0x01) {
-            memset(ddram_, ' ', sizeof(ddram_));
-            address_ = shift_ = 0;
-            increment_ = true;
+    void commandGeneric(uint8_t value) {
+        if (value & 0x80) {
+            address_ = value & 0x7F;
             space_ = Ddram;
-            ++revision_;
-            ++clearGeneration_;
-            // Clear Display preserves all accumulated CGRAM rows.
-        } else if (value == 0x02 || value == 0x03) {
-            address_ = shift_ = 0;
-            space_ = Ddram;
-            ++revision_;
-        } else if (value == 0x80 || value == 0xC0) {
-            address_ = value == 0x80 ? 0x00 : 0x40;
-            space_ = Ddram;
-            if (fixedRows_) {
-                shift_ = 0;
-                increment_ = true;
-                entryShift_ = false;
-            }
-        } else if (value & 0x80) {
-            const uint8_t address = value & 0x7F;
-            if (fixedRows_ && ddramIndex(address) < 0) {
-                space_ = Unknown;
-                return;
-            }
-            address_ = address;
-            space_ = Ddram;  // Keep legitimate partial-field address writes.
-        } else if (value & 0x40) {
+        }
+        else if (value & 0x40) {
             address_ = value & 0x3F;
             space_ = Cgram;
-        } else if (value & 0x20) {
-            // Function Set does not move the cursor or erase pixels.
-        } else if (value & 0x10) {
-            // The original MFJ mirror did not infer cursor/display shifts.
-            // In this profile they cannot permanently displace both rows.
-            if (fixedRows_) return;
-            if (value & 0x08) shiftDisplay((value & 0x04) == 0);
+        }
+        else if (value & 0x20) {
+            // Function Set does not change stored data or the address.
+        }
+        else if (value & 0x10) {
+            if (value & 0x08)
+                shiftDisplay((value & 0x04) == 0);
             else if (space_ == Cgram)
-                address_ = (address_ + ((value & 0x04) ? 1 : 63)) & 0x3F;
-            else advance((value & 0x04) != 0);
-        } else if (value & 0x08) {
+                address_ = static_cast<uint8_t>(
+                    (address_+((value & 0x04) ? 1 : 63))&0x3F);
+            else
+                advance((value & 0x04) != 0);
+        }
+        else if (value & 0x08) {
             displayOn_ = (value & 0x04) != 0;
             ++revision_;
-        } else if (value & 0x04) {
-            increment_ = fixedRows_ || (value & 0x02) != 0;
-            entryShift_ = !fixedRows_ && (value & 0x01) != 0;
+        }
+        else if (value & 0x04) {
+            increment_ = (value & 0x02) != 0;
+            entryShift_ = (value & 0x01) != 0;
+        }
+        else if (value & 0x02) {
+            address_ = shift_ = 0;
+            space_ = Ddram;
+            ++revision_;
+        }
+        else if (value & 0x01) {
+            clearDisplay();
         }
     }
 };
@@ -323,7 +418,7 @@ static_assert((CaptureRing::Capacity & (CaptureRing::Capacity - 1)) == 0,
               "Capture ring size must be a power of two");
 
 CaptureRing captureRing;
-LcdModel lcd(true);  // MFJ fixed 16x2 row profile, like the original parser.
+LcdModel lcd(true);  // Strict 0x80 / 0xC0 / 0x01 mirror.
 NibbleDecoder decoder;
 portMUX_TYPE lcdMux = portMUX_INITIALIZER_UNLOCKED;
 alignas(4) uint32_t captureEpoch = 1;
@@ -622,10 +717,9 @@ const char indexHtml[] PROGMEM = R"rawliteral(
   let lastCellSignatures = Array(32).fill('');
   let specialSequenceRunning = false;
   let activeLayout = null;
-  let lastMeterEvidenceAt = 0;
   let lastClearGeneration = null;
   const meterFields = new Map();
-  const METER_PARTIAL_GRACE_MS = 150;
+  const INVALID_FIELD_HOLD_MS = 120;
 
   const SPACE = 0x20;
   const MOMENTARY_MASK =
@@ -773,121 +867,129 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
   function resetMeterState() {
     activeLayout = null;
-    lastMeterEvidenceAt = 0;
     meterFields.clear();
     meterScreen.fill(SPACE);
   }
 
-  function findMainAnchor(screen, start, end, label) {
+  function findMainAnchor(screen,start,end,label) {
     const exact = findAscii(screen,start,end,label);
     if (exact >= 0) return exact;
-    // One damaged byte in a short label must not disable the fixed layout.
-    // Used only for main-screen recognition; never modifies a Setup screen.
-    let best = -1;
-    for (let offset = start; offset+label.length <= end; offset++) {
+
+    // Allow one damaged byte, but reject an ambiguous match.
+    let found = -1;
+    for (let offset=start;offset+label.length<=end;offset++) {
       let equal = 0;
-      for (let i = 0; i < label.length; i++)
+      for (let i=0;i<label.length;i++)
         if (screen[offset+i] === label.charCodeAt(i)) equal++;
       if (equal === label.length-1) {
-        if (best >= 0) return -1;  // Ambiguous label: do not guess.
-        best = offset;
+        if (found >= 0) return -1;
+        found = offset;
       }
     }
-    return best;
+    return found;
   }
 
   function mainAnchors(screen) {
     return {
-      mhz: findMainAnchor(screen,4,11,'MHz'),
+      mhz: findMainAnchor(screen,3,12,'MHz'),
       fwd: findMainAnchor(screen,16,25,'FWD='),
-      ref: findMainAnchor(screen,22,32,'REF=')
+      ref: findMainAnchor(screen,23,32,'REF=')
     };
   }
 
-  function extractMainFrequency(screen, anchors) {
-    if (anchors.mhz >= 0) {
-      const before = bytesToAscii(screen,Math.max(0,anchors.mhz-6),anchors.mhz);
-      const match = before.match(/[ 0-9]{1,2}[.,][0-9]{3}$/);
-      if (match) return match[0].padStart(6,' ').slice(-6);
+  function mainFrequency(screen,anchor) {
+    const row = bytesToAscii(screen,0,12);
+    if (anchor >= 0) {
+      const before = bytesToAscii(screen,Math.max(0,anchor-6),anchor);
+      const exact = before.match(/[ 0-9]{1,2}[.,][0-9]{3}$/);
+      if (exact) return exact[0].padStart(6,' ').slice(-6);
     }
-    // Value validation, not a text replacement. Labels stay in fixed cells.
-    const match = bytesToAscii(screen,0,9).match(/[ 0-9]{1,2}[.,][0-9]{3}/);
-    return match ? match[0].padStart(6,' ').slice(-6) : null;
+    const fallback = row.match(/[ 0-9]{1,2}[.,][0-9]{3}/);
+    return fallback ? fallback[0].padStart(6,' ').slice(-6) : null;
   }
 
-  function hasOtherScreenText(screen, anchors, frequency) {
+  function isExplicitOtherScreen(screen) {
     let microhenry = false;
     for (let i=0;i<15;i++)
       if (screen[i] === 0xE4 && screen[i+1] === 0x48) microhenry = true;
-    if (anchors.mhz < 0 &&
-        (microhenry || findAscii(screen,16,32,'pF') >= 0)) return true;
-    const text = Array.from(screen,value =>
-      value >= 32 && value <= 126 ? String.fromCharCode(value) : ' ');
-    for (const [offset,length] of [[anchors.mhz,3],[anchors.fwd,4],[anchors.ref,4]])
-      if (offset >= 0) for (let i=0;i<length;i++) text[offset+i]=' ';
-    const upperLetters = (text.slice(0,16).join('').match(/[A-Za-z]/g)||[]).length;
-    const lowerLetters = (text.slice(16).join('').match(/[A-Za-z]/g)||[]).length;
-    // A real new header or menu is shown immediately, with no confirming frame.
-    return (upperLetters >= 3 && !frequency) ||
-           (lowerLetters >= 3 && anchors.fwd < 0 && anchors.ref < 0);
+    if (microhenry || findAscii(screen,16,32,'pF') >= 0) return true;
+
+    const text = bytesToAscii(screen,0,32).replace(/\x01/g,' ');
+    return /SETUP|TARGET|AUTO TUNE|MEMORY|METER ?RANGE|POWER LEVEL|LC LIMIT|CAP |BYPASS|BEEP|STICKY|SEMI|SAVE CURRENT|VERSION|SELF TEST|RELAY TEST|WATTMETER|AUDIO|BRIDGE|COUNTER|DELETE|DEFAULT|TOTAL RESET/.test(text);
   }
 
-  function detectMainKind(screen) {
+  function classifyScreen(screen) {
     const anchors = mainAnchors(screen);
-    const frequency = extractMainFrequency(screen,anchors);
-    if (anchors.mhz >= 0 && countBarCells(screen) >= 4) return 'bar';
-    if (hasOtherScreenText(screen,anchors,frequency)) return null;
+    const frequency = mainFrequency(screen,anchors.mhz);
+    const barCells = countBarCells(screen);
 
-    const anchorCount = Object.values(anchors).filter(offset => offset >= 0).length;
+    if (barCells >= 4 &&
+        (anchors.mhz >= 0 || activeLayout === 'bar' ||
+         (frequency && anchors.fwd < 0 && anchors.ref < 0)))
+      return 'bar';
+
+    if (isExplicitOtherScreen(screen)) return null;
+
+    const anchorCount = Object.values(anchors)
+      .filter(offset => offset >= 0).length;
     let indicators = 0;
     [5,7,6].forEach((slot,index) => {
       const value = screen[9+index];
       if (value < 16 && (value & 7) === slot) indicators++;
     });
+
     if (anchorCount >= 2 ||
-        (frequency && indicators >= 2)) return 'meter';
-    if (activeLayout === 'meter' &&
-        Date.now()-lastMeterEvidenceAt <= METER_PARTIAL_GRACE_MS &&
-        (frequency || anchorCount > 0)) return 'meter';
+        (frequency && indicators >= 2) ||
+        (frequency && (anchors.fwd >= 0 || anchors.ref >= 0)))
+      return 'meter';
+
+    // Once positively recognized, the main layout survives damaged anchors.
+    // A real 0x01 or an explicit other-screen heading releases this latch.
+    if (activeLayout === 'meter') return 'meter';
     return null;
   }
 
-  function setMeterField(offset, length, value) {
+  function setMeterField(offset,length,value) {
     const now = Date.now();
-    if (value != null) meterFields.set(offset,{value,at:now});
+    if (value != null) meterFields.set(offset,{value:value,at:now});
     const cached = meterFields.get(offset);
-    // Bridge only a short partial write, never an indefinite stale reading.
-    const current = value != null ? value
-      : cached && now-cached.at <= METER_PARTIAL_GRACE_MS ? cached.value : null;
-    if (current != null)
-      writeAscii(meterScreen,offset,current.padStart(length,' ').slice(-length));
+    const visible = value != null ? value :
+      cached && now-cached.at <= INVALID_FIELD_HOLD_MS ? cached.value : null;
+    if (visible != null)
+      writeAscii(meterScreen,offset,visible.padStart(length,' ').slice(-length));
   }
 
-  function antennaGlyph(cgram) {
-    const result = new Uint8Array(cgram);
-    result[41] = result[47] = 0;
-    result.set((buttonMask & 1) ? [7,1,7,4,7] : [2,6,2,2,7],42);
-    return result;
-  }
-
-  function validNumberAt(screen, offset) {
+  function validNumberAt(screen,offset) {
     const value = bytesToAscii(screen,offset,offset+3);
     return /^(?:[0-9][.,\/][0-9]|[ 0-9]{3})$/.test(value) && /[0-9]/.test(value)
       ? value : null;
   }
 
-  function drawMeterSnapshot(screen, cgram) {
+  function antennaGlyph(cgram) {
+    const result = new Uint8Array(cgram);
+    // Keep live IntelliTune row; the antenna numeral comes from ANT state.
+    result[41] = result[47] = 0;
+    result.set((buttonMask & 1) ? [7,1,7,4,7] : [2,6,2,2,7],42);
+    return result;
+  }
+
+  function drawMeterSnapshot(screen,cgram) {
     const anchors = mainAnchors(screen);
-    const frequency = extractMainFrequency(screen,anchors);
     meterScreen.fill(SPACE);
-    setMeterField(0,6,frequency);
+
+    setMeterField(0,6,mainFrequency(screen,anchors.mhz));
     writeAscii(meterScreen,6,'MHz');
     meterScreen.set([5,7,6],9);
     setMeterField(13,3,validNumberAt(screen,13));
+
     writeAscii(meterScreen,16,'FWD=');
-    setMeterField(20,3,extractValueAfter(screen,anchors.fwd) || validNumberAt(screen,20));
+    setMeterField(20,3,
+      extractValueAfter(screen,anchors.fwd) || validNumberAt(screen,20));
+
     writeAscii(meterScreen,25,'REF=');
-    setMeterField(29,3,extractValueAfter(screen,anchors.ref) || validNumberAt(screen,29));
+    setMeterField(29,3,
+      extractValueAfter(screen,anchors.ref) || validNumberAt(screen,29));
+
     drawScreen(meterScreen,antennaGlyph(cgram));
   }
 
@@ -900,6 +1002,7 @@ const char indexHtml[] PROGMEM = R"rawliteral(
         lastClearGeneration = clear;
       }
     }
+
     if ((buttonMask & (1 << 8)) === 0) {
       resetMeterState();
       drawScreen(powerOffScreen);
@@ -908,24 +1011,24 @@ const char indexHtml[] PROGMEM = R"rawliteral(
 
     const screen = data.subarray(1,33);
     const cgram = data.subarray(33,97);
+
     if (screen.every(value => value === SPACE)) {
       resetMeterState();
       drawScreen(screen,cgram);
       return;
     }
 
-    const kind = detectMainKind(screen);
+    const kind = classifyScreen(screen);
     if (kind === 'meter' && fixMeterLayout) {
       if (activeLayout !== 'meter') meterFields.clear();
       activeLayout = 'meter';
-      if (Object.values(mainAnchors(screen)).some(offset => offset >= 0))
-        lastMeterEvidenceAt = Date.now();
       drawMeterSnapshot(screen,cgram);
-    } else {
-      resetMeterState();
-      activeLayout = kind;
-      drawScreen(screen,cgram,kind === 'bar' && fixMeterLayout);
+      return;
     }
+
+    if (activeLayout === 'meter') meterFields.clear();
+    activeLayout = kind;
+    drawScreen(screen,cgram,kind === 'bar' && fixMeterLayout);
   }
 
   function requestLcdSnapshot() {
