@@ -2072,7 +2072,7 @@ String buildCaptureStats()
     message += ",\"rawDropped\":";
     message += rawEventDropCounter;
     message += ",\"stage\":";
-    message += stage;
+    message += (unsigned int)stage;
     message += ",\"space\":\"";
     message += spaceName;
     message += "\",\"address\":\"";
