@@ -46,11 +46,11 @@ const uint32_t MASK_LCD_BUS =
     MASK_DB6 |
     MASK_DB7;
 
-const uint32_t SAMPLE_DELAY = 110;
+const uint32_t SAMPLE_DELAY = 0; // немедленная выборка после обнаружения E=1
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 
-const char FIRMWARE_VERSION[] = "2026.09.15-diag1";
+const char FIRMWARE_VERSION[] = "2026.09.15-diag2-immediate";
 const uint32_t OTA_HEALTH_CONFIRM_MS = 15000;
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
@@ -172,7 +172,7 @@ struct RawBusEvent {
 
 // Один производитель на core 1 и один потребитель на core 0.
 // Переполнение теряет только строку диагностики, но не импульс декодера.
-const uint16_t RAW_EVENT_CAPACITY = 1024;
+const uint16_t RAW_EVENT_CAPACITY = 2048;
 RawBusEvent rawEvents[RAW_EVENT_CAPACITY];
 volatile uint16_t rawEventHead = 0;
 volatile uint16_t rawEventTail = 0;
@@ -2711,7 +2711,7 @@ void setup()
         delay(1000);
         ESP.restart();
     }
-    Serial.println("LCD capture: SAMPLE_DELAY=110, capture=s1");
+    Serial.println("LCD capture: immediate after E=1, capture=s1");
     Serial.println("Web LCD: atomic live snapshots, no frame-matching delay");
     Serial.println("Nibble sync: reset incomplete byte only");
     Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
@@ -2729,18 +2729,13 @@ void loop()
     }
 
     if (REG_READ(GPIO_IN_REG) & MASK_E) {
-        uint32_t start = xthal_get_ccount();
-
-        while (
-            (uint32_t)(xthal_get_ccount() - start) < SAMPLE_DELAY
-        ) {
-            // Критический участок: ничего сюда не добавлять.
-        }
-
-        // Момент выборки полностью повторяет удачную терминальную версию.
+        // DB4...DB7 и RS уже установлены до фронта E. Читаем их сразу:
+        // при полке около 520 нс задержка 110 циклов оставляла почти нулевой
+        // запас и фактически давала уровни после полезного окна.
         uint32_t s1 = REG_READ(GPIO_IN_REG);
 
-        // Только диагностика. Для декодирования s2 не используется.
+        // Второе немедленное чтение используется только для счётчика U.
+        // Основной декодер всегда получает первое значение.
         uint32_t s2 = REG_READ(GPIO_IN_REG);
 
         uint32_t reg = s1;
