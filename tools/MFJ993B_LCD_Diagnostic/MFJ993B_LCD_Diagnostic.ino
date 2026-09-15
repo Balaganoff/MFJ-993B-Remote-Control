@@ -50,8 +50,9 @@ const uint32_t SAMPLE_DELAY = 0; // немедленная выборка пос
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 
-const char FIRMWARE_VERSION[] = "2026.09.15-diag2-immediate";
+const char FIRMWARE_VERSION[] = "2026.09.15-diag3-ota-race-fix";
 const uint32_t OTA_HEALTH_CONFIRM_MS = 15000;
+const uint32_t OTA_UPLOAD_IDLE_TIMEOUT_MS = 600000;
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
@@ -1399,7 +1400,7 @@ const char updateHtml[] PROGMEM = R"rawliteral(
 
     const request = new XMLHttpRequest();
     request.open('POST', '/update');
-    request.timeout = 300000;
+    request.timeout = 900000;
 
     request.upload.onprogress = event => {
       if (!event.lengthComputable) return;
@@ -2513,11 +2514,19 @@ void initializeNetworkAndWeb()
            size_t length,
            bool final) {
             if (index == 0) {
+                // Сначала публикуем отметку времени, и только затем флаг.
+                // Иначе TaskNetwork может увидеть новый флаг со старым now и
+                // получить беззнаковое переполнение разности времени.
+                webUpdateInProgress = false;
                 webUpdateFailed = false;
                 webUpdateSucceeded = false;
                 webUpdateRestartPending = false;
                 webUpdateLastActivityMs = millis();
+                __sync_synchronize();
                 webUpdateInProgress = true;
+
+                // Во время прошивки сырой журнал не должен занимать core 0.
+                rawEventTail = rawEventHead;
 
                 releaseMomentaryButtons();
 
@@ -2592,15 +2601,19 @@ void TaskNetwork(void *parameter)
     for (;;) {
         uint32_t now = millis();
 
-        drainRawBusEvents();
-        printStableScreenToSerial(now);
+        // Захват на core 1 также останавливается по этому флагу.
+        // На core 0 во время OTA не печатаем Serial и не отправляем WS.
+        if (!webUpdateInProgress) {
+            drainRawBusEvents();
+            printStableScreenToSerial(now);
 
-        if (
-            ws.count() > 0 &&
-            (uint32_t)(now - lastStatsMs) >= 250
-        ) {
-            lastStatsMs = now;
-            ws.textAll(buildCaptureStats());
+            if (
+                ws.count() > 0 &&
+                (uint32_t)(now - lastStatsMs) >= 250
+            ) {
+                lastStatsMs = now;
+                ws.textAll(buildCaptureStats());
+            }
         }
 
         if (
@@ -2643,14 +2656,22 @@ void TaskNetwork(void *parameter)
             ESP.restart();
         }
 
-        if (
-            webUpdateInProgress &&
-            (uint32_t)(now - webUpdateLastActivityMs) >= 60000
-        ) {
-            Update.abort();
-            webUpdateFailed = true;
-            webUpdateInProgress = false;
-            Serial.println("HTTP update aborted: timeout");
+        if (webUpdateInProgress) {
+            // millis() читается после флага; signed-разность защищает от
+            // ситуации, когда callback только что записал более новое время.
+            __sync_synchronize();
+            uint32_t lastActivity = webUpdateLastActivityMs;
+            uint32_t uploadNow = millis();
+
+            if (
+                (int32_t)(uploadNow - lastActivity) >=
+                (int32_t)OTA_UPLOAD_IDLE_TIMEOUT_MS
+            ) {
+                Update.abort();
+                webUpdateFailed = true;
+                webUpdateInProgress = false;
+                Serial.println("HTTP update aborted: 10 min idle");
+            }
         }
 
         if ((uint32_t)(now - lastCleanupMs) >= 5000) {
