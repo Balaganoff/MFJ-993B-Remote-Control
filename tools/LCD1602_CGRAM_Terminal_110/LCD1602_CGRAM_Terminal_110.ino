@@ -33,11 +33,11 @@ const uint32_t MASK_LCD_BUS =
     MASK_DB6 |
     MASK_DB7;
 
-const uint32_t SAMPLE_DELAY = 110;
+const uint32_t SAMPLE_DELAY = 90;
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 // Ждём окончания пачки записи, чтобы не печатать посимвольное стирание шкал.
 // Экраны Setup Mode держатся намного дольше, поэтому 12 мс их не пропустят.
-const uint32_t DISPLAY_IDLE_US = 12000;
+const uint32_t DISPLAY_IDLE_US = 2000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 
 // ============================================================================
@@ -493,7 +493,7 @@ void printLcdCharacter(uint8_t value)
     else if (value == 0xE4) {
         Serial.print("µ");
     }
-    else if (value >= 32 && value <= 126) {
+    else if (value >= 32 && value <= 255) {
         Serial.write(value);
     }
     else {
