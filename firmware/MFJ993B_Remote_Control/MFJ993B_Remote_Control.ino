@@ -1,13 +1,14 @@
-// MFJ-993B Remote Control — LCD comparative diagnostic build — USER_CAPTURE_V8
+// MFJ-993B Remote Control — raw LCD bus recorder — V9
 //
-// Ядро 1: захват из LCD1602_CGRAM_Terminal_110 — ожидание 110 тактов,
-// затем два последовательных чтения GPIO; декодируется первая выборка.
-// Ядро 0: Wi-Fi, WebSocket, кнопки, диагностика и защищённое HTTP OTA.
-// Одновременно доступны виртуальный LCD, сырые DDRAM-байты и поток
-// полубайтов R/W+RS+D4...D7. Текстовых якорей и исправления экрана нет.
+// Ядро 1 пассивно записывает каждый импульс E без фильтрации по R/W и без
+// попытки склеить полубайты. Для каждого импульса сохраняются первое и
+// последнее состояния при E=1, первое после E=0, маска изменений и число
+// выборок RS/RW/D4..D7 на высокой полке E.
+// Ядро 0 печатает только законченный пакет, поэтому сырой захват не забивает
+// WebSocket и не мешает самому измерению.
 
 // MFJ-993B remote control and literal HD44780 LCD mirror.
-// Core 1 polls E and decodes only LCD write cycles (R/W=0).
+// Core 1 polls E, mirrors writes and tracks address-changing read cycles.
 // Wi-Fi, WebSocket and OTA run on core 0.
 // The browser does not parse screens or use textual anchors.
 
@@ -51,13 +52,9 @@ const uint32_t MASK_LCD_BUS =
     MASK_DB6 |
     MASK_DB7;
 
-// По реальному логу два записываемых полубайта разделены примерно 52 мкс.
-// Большой таймаут сбрасывает только действительно оборванный байт.
-const uint32_t NIBBLE_PAIR_MAX_US = 5000;
-const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
-const uint32_t USER_CAPTURE_DELAY_CYCLES = 110;
-
-const char FIRMWARE_VERSION[] = "2026.09.16-user110-diag-v8";
+// В протоколе HD44780 нет максимального интервала между двумя половинами
+// 4-битной передачи, поэтому V7 не использует временной порог для их склейки.
+const char FIRMWARE_VERSION[] = "2026.09.16-raw-e-window-v9";
 const uint32_t OTA_HEALTH_CONFIRM_MS = 15000;
 const uint32_t OTA_UPLOAD_IDLE_TIMEOUT_MS = 600000;
 
@@ -107,6 +104,9 @@ enum LcdAddressSpace : uint8_t {
     LCD_SPACE_CGRAM
 };
 
+// HD44780 содержит 80 байт DDRAM: 00h..27h и 40h..67h. lcdScreen —
+// производная видимая область 16x2, отправляемая существующему Web UI.
+uint8_t lcdDdram[80];
 uint8_t lcdScreen[32];
 uint8_t lcdCgram[8][8];
 uint8_t lcdCgramKnownRows[8];
@@ -115,18 +115,14 @@ volatile LcdAddressSpace lcdAddressSpace = LCD_SPACE_NONE;
 volatile uint8_t lcdAddress = 0;
 volatile uint8_t lcdCgramAddress = 0;
 volatile bool entryIncrement = true;
+volatile bool entryShift = false;
+volatile uint8_t lcdDisplayShift = 0;
 volatile bool lcdDisplayOn = true;
 
 portMUX_TYPE lcdMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile uint32_t lcdVersion = 0;
 volatile uint16_t lcdClearGeneration = 0;
-
-// Одна команда 0x40...0x7F ещё не доказывает запись CGRAM: на общей
-// шине возможен ошибочно собранный байт. Принимаем пиксели только сразу
-// после Set CGRAM Address и только в допустимом диапазоне 0x00...0x1F.
-bool cgramCandidateActive = false;
-uint32_t cgramCandidateLastUs = 0;
 
 // ============================================================================
 // СБОРКА БАЙТА
@@ -135,9 +131,10 @@ uint32_t cgramCandidateLastUs = 0;
 uint8_t stage = 0;
 uint8_t firstNibble = 0;
 bool firstNibbleRs = false;
-uint32_t lastBusTime = 0;
+uint8_t readStage = 0;
+uint8_t readFirstNibble = 0;
+bool readFirstNibbleRs = false;
 bool fourBitModeSeen = false;
-uint8_t initializationNibbles = 0;
 volatile bool decoderResetRequested = false;
 
 // ============================================================================
@@ -150,39 +147,22 @@ volatile uint32_t addressCounter = 0;
 volatile uint32_t ignoredCommandCounter = 0;
 volatile uint32_t acceptedDataCounter = 0;
 volatile uint32_t rejectedDataCounter = 0;
-volatile uint32_t timeoutCounter = 0;
 volatile uint32_t rsMismatchCounter = 0;
 volatile uint32_t readBoundaryResetCounter = 0;
 volatile uint32_t sampleDifferenceCounter = 0;
 volatile uint32_t lastPulseAtMs = 0;
 volatile uint32_t lcdReadPulseCounter = 0;
 volatile uint32_t lcdWritePulseCounter = 0;
-volatile uint32_t shortPulseDropCounter = 0;
-
-// Отдельная диагностическая сборка байтов не влияет на основной декодер.
-uint8_t rawDiagnosticStage = 0;
-uint8_t rawDiagnosticFirstNibble = 0;
-bool rawDiagnosticFirstRs = false;
-bool rawDiagnosticFirstRw = false;
-uint32_t rawDiagnosticLastUs = 0;
-
-enum RawEventFlags : uint8_t {
-    RAW_FIRST_NIBBLE = 0x01,
-    RAW_COMPLETE_BYTE = 0x02,
-    RAW_TIMEOUT_RESET = 0x04,
-    RAW_RS_CHANGED = 0x08,
-    RAW_SAMPLE_DIFFERENCE = 0x10,
-    RAW_RW_CHANGED = 0x20
-};
+volatile uint32_t singleSamplePulseCounter = 0;
 
 struct RawBusEvent {
     uint32_t sequence;
     uint32_t gapUs;
-    uint8_t nibble;
-    uint8_t value;
-    uint8_t flags;
-    uint8_t rs;
-    uint8_t rw;
+    uint16_t highSamples;
+    uint8_t firstBus;
+    uint8_t lastBus;
+    uint8_t afterBus;
+    uint8_t changedBus;
 };
 
 // Один производитель на core 1 и один потребитель на core 0.
@@ -196,14 +176,53 @@ volatile uint32_t rawEventSequence = 0;
 volatile uint32_t rawEventDropCounter = 0;
 volatile bool rawCaptureEnabled = false;
 volatile uint16_t rawCaptureRemaining = 0;
+volatile bool rawHeaderPending = false;
+volatile bool rawSummaryPending = false;
+volatile uint32_t rawLastPulseUs = 0;
+volatile uint32_t rawRwFirstLow = 0;
+volatile uint32_t rawRwFirstHigh = 0;
+volatile uint32_t rawRwLastLow = 0;
+volatile uint32_t rawRwLastHigh = 0;
+volatile uint32_t rawRwChangedDuringE = 0;
+volatile uint32_t rawRsChangedDuringE = 0;
+volatile uint32_t rawDataChangedDuringE = 0;
+volatile uint32_t rawAnyChangedDuringE = 0;
+volatile uint32_t rawRwChangedAfterE = 0;
+volatile uint32_t rawAnyChangedAfterE = 0;
+volatile uint32_t rawRwTransitionsAll = 0;
+volatile bool rawRwLevelKnown = false;
+volatile bool rawRwPreviousLevel = false;
+volatile uint16_t rawMinHighSamples = UINT16_MAX;
+volatile uint16_t rawMaxHighSamples = 0;
+
+// Упаковка одной выборки в шесть младших битов:
+// b0..b3=D4..D7, b4=RS, b5=R/W.
+static inline uint8_t packRawBus(uint32_t sample)
+{
+    uint8_t packed = 0;
+
+    if (sample & MASK_DB4) packed |= 0x01;
+    if (sample & MASK_DB5) packed |= 0x02;
+    if (sample & MASK_DB6) packed |= 0x04;
+    if (sample & MASK_DB7) packed |= 0x08;
+
+    if (sample & MASK_RS) {
+        packed |= 0x10;
+    }
+    if (sample & MASK_RW) {
+        packed |= 0x20;
+    }
+
+    return packed;
+}
 
 static inline void pushRawEvent(
-    uint8_t nibble,
-    bool rs,
-    bool rw,
-    uint32_t gapUs,
-    uint8_t flags,
-    uint8_t value
+    uint8_t firstBus,
+    uint8_t lastBus,
+    uint8_t afterBus,
+    uint8_t changedBus,
+    uint16_t highSamples,
+    uint32_t gapUs
 ) {
     uint16_t head = rawEventHead;
     uint16_t next = (uint16_t)((head + 1) % RAW_EVENT_CAPACITY);
@@ -216,11 +235,11 @@ static inline void pushRawEvent(
     RawBusEvent &event = rawEvents[head];
     event.sequence = ++rawEventSequence;
     event.gapUs = gapUs;
-    event.nibble = nibble;
-    event.value = value;
-    event.flags = flags;
-    event.rs = rs ? 1 : 0;
-    event.rw = rw ? 1 : 0;
+    event.highSamples = highSamples;
+    event.firstBus = firstBus;
+    event.lastBus = lastBus;
+    event.afterBus = afterBus;
+    event.changedBus = changedBus;
 
     __sync_synchronize();
     rawEventHead = next;
@@ -243,67 +262,105 @@ bool popRawEvent(void *destination)
     return true;
 }
 
-static inline void recordRawNibble(
-    uint8_t nibble,
-    bool currentRs,
-    bool currentRw,
-    uint32_t now,
-    bool sampleUnstable
+static inline void recordRawPulse(
+    uint32_t firstSample,
+    uint32_t lastSample,
+    uint32_t afterSample,
+    uint32_t changedMask,
+    uint16_t highSamples,
+    uint32_t now
 ) {
-    uint8_t flags = sampleUnstable ? RAW_SAMPLE_DIFFERENCE : 0;
-    uint8_t value = 0;
+    uint8_t firstBus = packRawBus(firstSample);
+    uint8_t lastBus = packRawBus(lastSample);
+    uint8_t afterBus = packRawBus(afterSample);
+    uint8_t changedBus = packRawBus(changedMask);
     uint32_t gapUs =
-        rawDiagnosticLastUs == 0
+        rawLastPulseUs == 0
             ? 0
-            : (uint32_t)(now - rawDiagnosticLastUs);
+            : (uint32_t)(now - rawLastPulseUs);
 
-    if (
-        rawDiagnosticLastUs != 0 &&
-        gapUs > NIBBLE_PAIR_MAX_US
-    ) {
-        if (rawDiagnosticStage != 0) {
-            flags |= RAW_TIMEOUT_RESET;
-        }
-        rawDiagnosticStage = 0;
-    }
+    rawLastPulseUs = now;
 
-    if (rawDiagnosticStage != 0) {
-        if (currentRs != rawDiagnosticFirstRs) {
-            flags |= RAW_RS_CHANGED;
-            rawDiagnosticStage = 0;
-        }
-
-        if (currentRw != rawDiagnosticFirstRw) {
-            flags |= RAW_RW_CHANGED;
-            rawDiagnosticStage = 0;
-        }
-    }
-
-    rawDiagnosticLastUs = now;
-
-    if (rawDiagnosticStage == 0) {
-        rawDiagnosticFirstNibble = nibble;
-        rawDiagnosticFirstRs = currentRs;
-        rawDiagnosticFirstRw = currentRw;
-        rawDiagnosticStage = 1;
-        flags |= RAW_FIRST_NIBBLE;
+    if (firstBus & 0x20) {
+        rawRwFirstHigh++;
     }
     else {
-        value = (uint8_t)(
-            (rawDiagnosticFirstNibble << 4) | nibble
-        );
-        rawDiagnosticStage = 0;
-        flags |= RAW_COMPLETE_BYTE;
+        rawRwFirstLow++;
+    }
+
+    if (lastBus & 0x20) {
+        rawRwLastHigh++;
+    }
+    else {
+        rawRwLastLow++;
+    }
+
+    if (changedBus != 0) {
+        rawAnyChangedDuringE++;
+    }
+    if (changedBus & 0x20) {
+        rawRwChangedDuringE++;
+    }
+    if (changedBus & 0x10) {
+        rawRsChangedDuringE++;
+    }
+    if (changedBus & 0x0F) {
+        rawDataChangedDuringE++;
+    }
+    if ((lastBus ^ afterBus) & 0x20) {
+        rawRwChangedAfterE++;
+    }
+    if (lastBus != afterBus) {
+        rawAnyChangedAfterE++;
+    }
+
+    if (highSamples < rawMinHighSamples) {
+        rawMinHighSamples = highSamples;
+    }
+    if (highSamples > rawMaxHighSamples) {
+        rawMaxHighSamples = highSamples;
     }
 
     pushRawEvent(
-        nibble,
-        currentRs,
-        currentRw,
-        gapUs,
-        flags,
-        value
+        firstBus,
+        lastBus,
+        afterBus,
+        changedBus,
+        highSamples,
+        gapUs
     );
+}
+
+void armRawCapture()
+{
+    rawCaptureEnabled = false;
+    __sync_synchronize();
+
+    rawEventTail = rawEventHead;
+    rawEventSequence = 0;
+    rawEventDropCounter = 0;
+    rawLastPulseUs = 0;
+    rawRwFirstLow = 0;
+    rawRwFirstHigh = 0;
+    rawRwLastLow = 0;
+    rawRwLastHigh = 0;
+    rawRwChangedDuringE = 0;
+    rawRsChangedDuringE = 0;
+    rawDataChangedDuringE = 0;
+    rawAnyChangedDuringE = 0;
+    rawRwChangedAfterE = 0;
+    rawAnyChangedAfterE = 0;
+    rawRwTransitionsAll = 0;
+    rawRwLevelKnown = false;
+    rawRwPreviousLevel = false;
+    rawMinHighSamples = UINT16_MAX;
+    rawMaxHighSamples = 0;
+    rawHeaderPending = true;
+    rawSummaryPending = false;
+    rawCaptureRemaining = RAW_CAPTURE_EVENT_LIMIT;
+
+    __sync_synchronize();
+    rawCaptureEnabled = true;
 }
 
 // ============================================================================
@@ -608,9 +665,9 @@ const char indexHtml[] PROGMEM = R"rawliteral(
     <summary>Диагностика захвата LCD</summary>
     <div class="diag-body">
       <div class="diag-note">
-        Верхний дисплей — итог декодера. Ниже те же 32 байта без оформления
-        и короткий ручной захват полубайтов записей RS/D4...D7. Циклы R/W=1
-        отсекаются до декодера. Экранных фильтров здесь нет.
+        Верхний дисплей — итог декодера. Ниже те же 32 видимых байта без
+        оформления и короткий ручной захват R/W, RS и DB4...DB7. Зеркало
+        исполняет только циклы записи R/W=0. Экранных фильтров здесь нет.
       </div>
 
       <div class="diag-title">Состояние захвата</div>
@@ -827,8 +884,8 @@ R2 HEX 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20</pre>
 
       captureStats.textContent =
         'pulses=' + value.pulses +
-        '  writes=' + value.writes +
-        '  reads=' + value.reads + '\n' +
+        '  RW=0 at E-fall=' + value.writes +
+        '  RW=1 at E-fall=' + value.reads + '\n' +
         '  bytes=' + value.bytes +
         '  accepted=' + value.accepted +
         '  rejected=' + value.rejected + '\n' +
@@ -836,11 +893,10 @@ R2 HEX 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20</pre>
         '  commands_ignored=' + value.ignored +
         '  space=' + value.space +
         '  AC=0x' + value.address + '\n' +
-        'timeouts=' + value.timeouts +
-        '  rs_between_nibbles=' + value.rsMismatch +
-        '  read_boundary_resets=' + value.readResets + '\n' +
+        'rs_between_nibbles=' + value.rsMismatch +
+        '  rw_boundary_resets=' + value.readResets + '\n' +
         '  bus_changes_during_E=' + value.sampleDiff +
-        '  sample_after_E_low=' + value.shortDrop +
+        '  single_sample_pulses=' + value.singleSample +
         '  raw_dropped=' + value.rawDropped + '\n' +
         'stage=' + value.stage +
         '  last E pulse: ' + age;
@@ -868,7 +924,7 @@ R2 HEX 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20</pre>
   }
 
   function resetRawView() {
-    rawLines = ['SEQ       GAPus RW RS HALF NIB BYTE FLAGS'];
+    rawLines = ['SEQ       GAPus SAMPLES  F_RS F_RW F_N  L_RS L_RW L_N  A_RS A_RW A_N  CHG6'];
     busLog.textContent = rawLines[0] + '\n';
   }
 
@@ -1634,43 +1690,94 @@ static inline uint8_t readNibble(uint32_t reg)
     return nibble;
 }
 
-static inline int addressToPosition(uint8_t address)
+static inline int ddramAddressToIndex(uint8_t address)
 {
-    if (address <= 0x0F) {
+    address &= 0x7F;
+
+    if (address <= 0x27) {
         return address;
     }
 
-    if (address >= 0x40 && address <= 0x4F) {
-        return 16 + (address - 0x40);
+    if (address >= 0x40 && address <= 0x67) {
+        return 40 + (address - 0x40);
     }
 
     return -1;
 }
 
-static inline bool isValidDdramValue(uint8_t value)
+static inline uint8_t ddramIndexToAddress(uint8_t index)
 {
-    return
-        value <= 0x07 ||
-        (value >= 0x20 && value <= 0x7E) ||
-        value == 0xE4;
+    index %= 80;
+    return index < 40 ? index : (uint8_t)(0x40 + index - 40);
 }
 
-static inline void advanceDdramAddress()
+static inline uint8_t steppedDdramAddress(
+    uint8_t address,
+    bool increment
+) {
+    int index = ddramAddressToIndex(address);
+
+    if (index < 0) {
+        return increment
+            ? (uint8_t)((address + 1) & 0x7F)
+            : (uint8_t)((address - 1) & 0x7F);
+    }
+
+    index = increment
+        ? (index + 1) % 80
+        : (index + 79) % 80;
+
+    return ddramIndexToAddress((uint8_t)index);
+}
+
+// Вызывать только под lcdMux. lcdDisplayShift — адрес первой видимой
+// позиции каждой из двух 40-символьных строк DDRAM.
+static inline bool rebuildVisibleScreenLocked()
 {
-    if (entryIncrement) {
-        lcdAddress = (uint8_t)((lcdAddress + 1) & 0x7F);
+    bool changed = false;
+
+    for (uint8_t row = 0; row < 2; row++) {
+        for (uint8_t column = 0; column < 16; column++) {
+            uint8_t lineOffset =
+                (uint8_t)((lcdDisplayShift + column) % 40);
+            uint8_t value = lcdDdram[row * 40 + lineOffset];
+            uint8_t position = row * 16 + column;
+
+            if (lcdScreen[position] != value) {
+                lcdScreen[position] = value;
+                changed = true;
+            }
+        }
     }
-    else {
-        lcdAddress = (uint8_t)((lcdAddress - 1) & 0x7F);
+
+    return changed;
+}
+
+static inline void shiftDisplay(bool right)
+{
+    portENTER_CRITICAL(&lcdMux);
+
+    lcdDisplayShift = right
+        ? (uint8_t)((lcdDisplayShift + 39) % 40)
+        : (uint8_t)((lcdDisplayShift + 1) % 40);
+
+    if (rebuildVisibleScreenLocked()) {
+        lcdVersion++;
     }
+
+    portEXIT_CRITICAL(&lcdMux);
 }
 
 void processCommand(uint8_t command, uint32_t now)
 {
+    (void)now;
+
     if (command == 0x01) {
         portENTER_CRITICAL(&lcdMux);
 
+        memset(lcdDdram, ' ', sizeof(lcdDdram));
         memset(lcdScreen, ' ', sizeof(lcdScreen));
+        lcdDisplayShift = 0;
         lcdVersion++;
         lcdClearGeneration++;
 
@@ -1678,20 +1785,27 @@ void processCommand(uint8_t command, uint32_t now)
 
         lcdAddress = 0;
         lcdAddressSpace = LCD_SPACE_DDRAM;
-        cgramCandidateActive = false;
+        // Clear Display также устанавливает I/D=1; S не изменяется.
+        entryIncrement = true;
         return;
     }
 
-    if (command == 0x02) {
+    if ((command & 0xFE) == 0x02) {
+        portENTER_CRITICAL(&lcdMux);
+        lcdDisplayShift = 0;
+        if (rebuildVisibleScreenLocked()) {
+            lcdVersion++;
+        }
+        portEXIT_CRITICAL(&lcdMux);
+
         lcdAddress = 0;
         lcdAddressSpace = LCD_SPACE_DDRAM;
-        cgramCandidateActive = false;
         return;
     }
 
     if ((command & 0xFC) == 0x04) {
         entryIncrement = (command & 0x02) != 0;
-        cgramCandidateActive = false;
+        entryShift = (command & 0x01) != 0;
         return;
     }
 
@@ -1704,15 +1818,42 @@ void processCommand(uint8_t command, uint32_t now)
             lcdVersion++;
         }
         portEXIT_CRITICAL(&lcdMux);
+        return;
+    }
 
-        cgramCandidateActive = false;
+    if ((command & 0xF0) == 0x10) {
+        bool shiftDisplaySelected = (command & 0x08) != 0;
+        bool right = (command & 0x04) != 0;
+
+        if (shiftDisplaySelected) {
+            shiftDisplay(right);
+        }
+        else if (lcdAddressSpace == LCD_SPACE_DDRAM) {
+            lcdAddress = steppedDdramAddress(lcdAddress, right);
+        }
+        else if (lcdAddressSpace == LCD_SPACE_CGRAM) {
+            lcdCgramAddress = right
+                ? (uint8_t)((lcdCgramAddress + 1) & 0x3F)
+                : (uint8_t)((lcdCgramAddress - 1) & 0x3F);
+        }
+
+        return;
+    }
+
+    if ((command & 0xE0) == 0x20) {
+        // DL=1 действительно переводит LCD обратно в 8-битный режим.
+        // После этого DB0..DB3 нам недоступны; ждём одиночный 0x2,
+        // которым протокол снова выбирает 4-битный интерфейс.
+        if (command & 0x10) {
+            fourBitModeSeen = false;
+            stage = 0;
+            readStage = 0;
+        }
         return;
     }
 
     if ((command & 0xC0) == 0x40) {
         lcdCgramAddress = command & 0x3F;
-        cgramCandidateLastUs = now;
-        cgramCandidateActive = true;
         lcdAddressSpace = LCD_SPACE_CGRAM;
         addressCounter++;
         return;
@@ -1720,11 +1861,7 @@ void processCommand(uint8_t command, uint32_t now)
 
     if (command & 0x80) {
         lcdAddress = command & 0x7F;
-        lcdAddressSpace =
-            addressToPosition(lcdAddress) >= 0
-                ? LCD_SPACE_DDRAM
-                : LCD_SPACE_NONE;
-        cgramCandidateActive = false;
+        lcdAddressSpace = LCD_SPACE_DDRAM;
         addressCounter++;
         return;
     }
@@ -1735,17 +1872,7 @@ void processCommand(uint8_t command, uint32_t now)
 
 void processCgramData(uint8_t value, uint32_t now)
 {
-    if (
-        !cgramCandidateActive ||
-        (uint32_t)(now - cgramCandidateLastUs) >
-            CGRAM_BLOCK_TIMEOUT_US ||
-        (value & 0xE0) != 0
-    ) {
-        rejectedDataCounter++;
-        cgramCandidateActive = false;
-        lcdAddressSpace = LCD_SPACE_NONE;
-        return;
-    }
+    (void)now;
 
     uint8_t address = lcdCgramAddress & 0x3F;
     uint8_t character = address >> 3;
@@ -1771,7 +1898,6 @@ void processCgramData(uint8_t value, uint32_t now)
     portEXIT_CRITICAL(&lcdMux);
 
     acceptedDataCounter++;
-    cgramCandidateLastUs = now;
 
     if (entryIncrement) {
         lcdCgramAddress = (uint8_t)((address + 1) & 0x3F);
@@ -1784,37 +1910,37 @@ void processCgramData(uint8_t value, uint32_t now)
 void processDdramData(uint8_t value, uint32_t now)
 {
     (void)now;
-    int position = addressToPosition(lcdAddress);
+    int index = ddramAddressToIndex(lcdAddress);
 
-    if (position < 0 || position >= 32) {
+    if (index < 0 || index >= 80) {
         rejectedDataCounter++;
-        lcdAddressSpace = LCD_SPACE_NONE;
+        lcdAddress = steppedDdramAddress(
+            lcdAddress,
+            entryIncrement
+        );
         return;
     }
 
-    if (isValidDdramValue(value)) {
-        portENTER_CRITICAL(&lcdMux);
+    portENTER_CRITICAL(&lcdMux);
 
-        if (lcdScreen[position] != value) {
-            lcdScreen[position] = value;
-            lcdVersion++;
-        }
+    lcdDdram[index] = value;
 
-        portEXIT_CRITICAL(&lcdMux);
-        acceptedDataCounter++;
-    }
-    else {
-        // На настоящем LCD адрес всё равно сдвинулся бы. Сохраняем старый
-        // символ, но сдвигаем нашу копию, чтобы единичный мусор не сместил
-        // всю оставшуюся строку.
-        rejectedDataCounter++;
+    // При S=1 запись DDRAM сдвигает весь дисплей: влево при I/D=1,
+    // вправо при I/D=0. CGRAM на положение дисплея не влияет.
+    if (entryShift) {
+        lcdDisplayShift = entryIncrement
+            ? (uint8_t)((lcdDisplayShift + 1) % 40)
+            : (uint8_t)((lcdDisplayShift + 39) % 40);
     }
 
-    advanceDdramAddress();
-
-    if (addressToPosition(lcdAddress) < 0) {
-        lcdAddressSpace = LCD_SPACE_NONE;
+    if (rebuildVisibleScreenLocked()) {
+        lcdVersion++;
     }
+
+    portEXIT_CRITICAL(&lcdMux);
+
+    acceptedDataCounter++;
+    lcdAddress = steppedDdramAddress(lcdAddress, entryIncrement);
 }
 
 void processData(uint8_t value, uint32_t now)
@@ -1846,60 +1972,92 @@ static inline void processByte(
     }
 }
 
+static inline void processReadByte(uint8_t value, bool rs)
+{
+    if (!rs) {
+        // Busy Flag + Address Counter. BF находится в D7; остальные семь
+        // бит — фактический AC самого LCD и могут уточнить нашу копию.
+        uint8_t address = value & 0x7F;
+
+        if (lcdAddressSpace == LCD_SPACE_DDRAM) {
+            lcdAddress = address;
+        }
+        else if (lcdAddressSpace == LCD_SPACE_CGRAM) {
+            lcdCgramAddress = address & 0x3F;
+        }
+
+        return;
+    }
+
+    // Read Data не изменяет содержимое RAM, но после полного чтения AC
+    // сдвигается согласно I/D. Сдвига дисплея при чтении не происходит.
+    if (lcdAddressSpace == LCD_SPACE_DDRAM) {
+        lcdAddress = steppedDdramAddress(lcdAddress, entryIncrement);
+    }
+    else if (lcdAddressSpace == LCD_SPACE_CGRAM) {
+        lcdCgramAddress = entryIncrement
+            ? (uint8_t)((lcdCgramAddress + 1) & 0x3F)
+            : (uint8_t)((lcdCgramAddress - 1) & 0x3F);
+    }
+}
+
+static inline void processCapturedReadNibble(
+    uint8_t nibble,
+    bool currentRs
+) {
+    // До подтверждённого перехода в 4-битный режим один цикл чтения может
+    // быть полноценной 8-битной операцией, нижние четыре бита которой нам
+    // физически недоступны. Такой цикл нельзя интерпретировать как полбайта.
+    if (!fourBitModeSeen) {
+        readStage = 0;
+        return;
+    }
+
+    if (readStage == 0) {
+        readFirstNibble = nibble;
+        readFirstNibbleRs = currentRs;
+        readStage = 1;
+        return;
+    }
+
+    if (currentRs != readFirstNibbleRs) {
+        rsMismatchCounter++;
+        readFirstNibble = nibble;
+        readFirstNibbleRs = currentRs;
+        readStage = 1;
+        return;
+    }
+
+    uint8_t value =
+        (uint8_t)((readFirstNibble << 4) | nibble);
+
+    readStage = 0;
+    processReadByte(value, readFirstNibbleRs);
+}
+
 static inline void processCapturedNibble(
     uint8_t nibble,
     bool currentRs,
     uint32_t now
 ) {
-    if (decoderResetRequested) {
-        decoderResetRequested = false;
-        stage = 0;
-        firstNibble = 0;
-        firstNibbleRs = currentRs;
-        lastBusTime = 0;
-        fourBitModeSeen = false;
-        initializationNibbles = 0;
-    }
-
-    if (
-        lastBusTime != 0 &&
-        (uint32_t)(now - lastBusTime) > NIBBLE_PAIR_MAX_US
-    ) {
-        if (stage != 0) {
-            timeoutCounter++;
-        }
-
-        // Сбрасываем только недособранный байт. Адрес и выбранная память
-        // HD44780 при паузе не меняются.
-        stage = 0;
-    }
-
-    lastBusTime = now;
-
-    // При общем включении питания HD44780 сначала получает одиночные
-    // командные 0x3, затем одиночный 0x2 для перехода в 4-битный режим.
-    // Эти импульсы не являются парами полубайтов и не должны превращаться
-    // в ложные команды. Если ESP подключился к уже работающему LCD, первый
-    // обычный полубайт сразу переводит декодер в рабочий режим.
-    if (!fourBitModeSeen && currentRs) {
-        fourBitModeSeen = true;
-        initializationNibbles = 0;
-    }
-
-    if (!fourBitModeSeen && !currentRs && stage == 0) {
-        if (nibble == 0x03 && initializationNibbles < 3) {
-            initializationNibbles++;
+    // После питания контроллер LCD находится в 8-битном режиме. Согласно
+    // процедуре HD44780/ST7066 одиночные 0x3 остаются 8-битными Function
+    // Set, а одиночный 0x2 переводит интерфейс в 4-битный режим. Только
+    // после него каждый байт состоит из двух импульсов E: старшая половина,
+    // затем младшая. Если ESP подключился уже во время работы, переход RS
+    // к данным также однозначно означает, что 4-битный режим уже действует.
+    if (!fourBitModeSeen) {
+        if (!currentRs && nibble == 0x03) {
             return;
         }
 
-        if (nibble == 0x02 && initializationNibbles >= 2) {
+        if (!currentRs && nibble == 0x02) {
             fourBitModeSeen = true;
-            initializationNibbles = 0;
+            stage = 0;
             return;
         }
 
         fourBitModeSeen = true;
-        initializationNibbles = 0;
     }
 
     if (stage == 0) {
@@ -1938,12 +2096,16 @@ void clearCapturedLcdBeforePowerOn()
     // Захват уже работает и примет полную инициализацию LCD после включения.
     portENTER_CRITICAL(&lcdMux);
 
+    memset(lcdDdram, ' ', sizeof(lcdDdram));
     memset(lcdScreen, ' ', sizeof(lcdScreen));
     memset(lcdCgram, 0, sizeof(lcdCgram));
     memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
+    lcdDisplayShift = 0;
     lcdVersion++;
     lcdClearGeneration++;
-    lcdDisplayOn = true;
+    // Состояние внутреннего reset HD44780: дисплей выключен, DDRAM очищена,
+    // AC=0, I/D=1, S=0. Последующая команда Display Control включит вывод.
+    lcdDisplayOn = false;
 
     portEXIT_CRITICAL(&lcdMux);
 
@@ -1951,11 +2113,9 @@ void clearCapturedLcdBeforePowerOn()
 
     lcdAddress = 0;
     lcdCgramAddress = 0;
-    lcdAddressSpace = LCD_SPACE_NONE;
+    lcdAddressSpace = LCD_SPACE_DDRAM;
     entryIncrement = true;
-
-    cgramCandidateActive = false;
-    cgramCandidateLastUs = 0;
+    entryShift = false;
 
     // POWER OFF -> POWER ON начинает отдельный чистый диагностический сеанс.
     pulseCounter = 0;
@@ -1964,7 +2124,6 @@ void clearCapturedLcdBeforePowerOn()
     ignoredCommandCounter = 0;
     acceptedDataCounter = 0;
     rejectedDataCounter = 0;
-    timeoutCounter = 0;
     rsMismatchCounter = 0;
     readBoundaryResetCounter = 0;
     sampleDifferenceCounter = 0;
@@ -1972,25 +2131,10 @@ void clearCapturedLcdBeforePowerOn()
     lcdReadPulseCounter = 0;
     lcdWritePulseCounter = 0;
 
-    shortPulseDropCounter = 0;
+    singleSamplePulseCounter = 0;
 
-    // Если пользователь заранее включил короткий захват при POWER OFF,
-    // оставляем его взведённым для записи самой последовательности старта.
-    bool rawCaptureWasArmed = rawCaptureEnabled;
-    rawCaptureEnabled = false;
-    __sync_synchronize();
-    rawEventTail = rawEventHead;
-    rawEventSequence = 0;
-    rawEventDropCounter = 0;
-    rawDiagnosticStage = 0;
-    rawDiagnosticFirstNibble = 0;
-    rawDiagnosticFirstRs = false;
-    rawDiagnosticFirstRw = false;
-    rawDiagnosticLastUs = 0;
-    rawCaptureRemaining =
-        rawCaptureWasArmed ? RAW_CAPTURE_EVENT_LIMIT : 0;
-    __sync_synchronize();
-    rawCaptureEnabled = rawCaptureWasArmed;
+    // Каждый POWER OFF -> POWER ON автоматически начинает новый сырой пакет.
+    armRawCapture();
 }
 
 void applyButtonMask(uint16_t newMask)
@@ -2123,16 +2267,14 @@ String buildCaptureStats()
     message += acceptedDataCounter;
     message += ",\"rejected\":";
     message += rejectedDataCounter;
-    message += ",\"timeouts\":";
-    message += timeoutCounter;
     message += ",\"rsMismatch\":";
     message += rsMismatchCounter;
     message += ",\"readResets\":";
     message += readBoundaryResetCounter;
     message += ",\"sampleDiff\":";
     message += sampleDifferenceCounter;
-    message += ",\"shortDrop\":";
-    message += shortPulseDropCounter;
+    message += ",\"singleSample\":";
+    message += singleSamplePulseCounter;
     message += ",\"rawDropped\":";
     message += rawEventDropCounter;
     message += ",\"rawActive\":";
@@ -2154,60 +2296,53 @@ String buildCaptureStats()
 
 void drainRawBusEvents()
 {
+    // Пока core 1 заполняет ограниченный пакет, ничего не форматируем и не
+    // шлём по сети. Это исключает Serial/WebSocket из измерительного окна.
+    if (rawCaptureEnabled) {
+        return;
+    }
+
+    if (rawHeaderPending) {
+        rawHeaderPending = false;
+        Serial.println();
+        Serial.println("[RAW BEGIN]");
+        Serial.println("SEQ       GAPus SAMPLES  F_RS F_RW F_N  L_RS L_RW L_N  A_RS A_RW A_N  CHG6");
+
+        if (ws.count() > 0) {
+            ws.textAll(
+                "RSEQ       GAPus SAMPLES  F_RS F_RW F_N  L_RS L_RW L_N  A_RS A_RW A_N  CHG6\n"
+            );
+        }
+    }
+
     RawBusEvent event;
     String packet;
-    packet.reserve(2300);
+    packet.reserve(256);
     packet = 'R';
     uint8_t count = 0;
 
-    while (count < 24 && popRawEvent(&event)) {
-        char flags[8];
-        uint8_t flagPosition = 0;
-
-        if (event.flags & RAW_TIMEOUT_RESET) {
-            flags[flagPosition++] = 'T';
-        }
-        if (event.flags & RAW_RS_CHANGED) {
-            flags[flagPosition++] = 'R';
-        }
-        if (event.flags & RAW_RW_CHANGED) {
-            flags[flagPosition++] = 'W';
-        }
-        if (event.flags & RAW_SAMPLE_DIFFERENCE) {
-            flags[flagPosition++] = 'U';
-        }
-        if (flagPosition == 0) {
-            flags[flagPosition++] = '-';
-        }
-        flags[flagPosition] = 0;
-
-        char byteText[3] = "--";
-
-        if (event.flags & RAW_COMPLETE_BYTE) {
-            snprintf(
-                byteText,
-                sizeof(byteText),
-                "%02X",
-                event.value
-            );
-        }
-
-        char line[96];
+    while (count < 2 && popRawEvent(&event)) {
+        char line[144];
         snprintf(
             line,
             sizeof(line),
-            "%08lu %7lu  %c  %c   %c    %X   %s   %s\n",
+            "%08lu %7lu %7u    %u    %u   %X     %u    %u   %X     %u    %u   %X    %02X\n",
             (unsigned long)event.sequence,
             (unsigned long)event.gapUs,
-            event.rw ? 'R' : 'W',
-            event.rs ? 'D' : 'C',
-            (event.flags & RAW_FIRST_NIBBLE) ? 'H' : 'L',
-            event.nibble,
-            byteText,
-            flags
+            (unsigned int)event.highSamples,
+            (unsigned int)((event.firstBus >> 4) & 1),
+            (unsigned int)((event.firstBus >> 5) & 1),
+            (unsigned int)(event.firstBus & 0x0F),
+            (unsigned int)((event.lastBus >> 4) & 1),
+            (unsigned int)((event.lastBus >> 5) & 1),
+            (unsigned int)(event.lastBus & 0x0F),
+            (unsigned int)((event.afterBus >> 4) & 1),
+            (unsigned int)((event.afterBus >> 5) & 1),
+            (unsigned int)(event.afterBus & 0x0F),
+            (unsigned int)event.changedBus
         );
 
-        Serial.print("[BUS] ");
+        Serial.print("[RAW] ");
         Serial.print(line);
         packet += line;
         count++;
@@ -2215,6 +2350,57 @@ void drainRawBusEvents()
 
     if (count > 0 && ws.count() > 0) {
         ws.textAll(packet);
+    }
+
+    if (
+        rawSummaryPending &&
+        rawEventTail == rawEventHead
+    ) {
+        rawSummaryPending = false;
+        uint16_t minSamples =
+            rawMinHighSamples == UINT16_MAX
+                ? 0
+                : rawMinHighSamples;
+
+        char summary[384];
+        snprintf(
+            summary,
+            sizeof(summary),
+            "captured=%lu dropped=%lu "
+            "rw_first_0=%lu rw_first_1=%lu "
+            "rw_last_0=%lu rw_last_1=%lu "
+            "rw_changed_during_E=%lu rs_changed_during_E=%lu "
+            "data_changed_during_E=%lu any_changed_during_E=%lu "
+            "rw_changed_after_E=%lu any_changed_after_E=%lu "
+            "rw_transitions_all=%lu samples_min=%u samples_max=%u",
+            (unsigned long)rawEventSequence,
+            (unsigned long)rawEventDropCounter,
+            (unsigned long)rawRwFirstLow,
+            (unsigned long)rawRwFirstHigh,
+            (unsigned long)rawRwLastLow,
+            (unsigned long)rawRwLastHigh,
+            (unsigned long)rawRwChangedDuringE,
+            (unsigned long)rawRsChangedDuringE,
+            (unsigned long)rawDataChangedDuringE,
+            (unsigned long)rawAnyChangedDuringE,
+            (unsigned long)rawRwChangedAfterE,
+            (unsigned long)rawAnyChangedAfterE,
+            (unsigned long)rawRwTransitionsAll,
+            (unsigned int)minSamples,
+            (unsigned int)rawMaxHighSamples
+        );
+
+        Serial.print("[RAW SUMMARY] ");
+        Serial.println(summary);
+        Serial.println("[RAW END]");
+        Serial.println();
+
+        if (ws.count() > 0) {
+            String message = "R[SUMMARY] ";
+            message += summary;
+            message += "\n[END]\n";
+            ws.textAll(message);
+        }
     }
 }
 
@@ -2339,21 +2525,7 @@ void handleWebSocketEvent(
         data[0] == 'D' &&
         !webUpdateInProgress
     ) {
-        // Сырой поток включается только на ограниченное число записей.
-        // Между захватами core 0 не форматирует и не рассылает BUS-строки.
-        rawCaptureEnabled = false;
-        __sync_synchronize();
-        rawEventTail = rawEventHead;
-        rawEventSequence = 0;
-        rawEventDropCounter = 0;
-        rawDiagnosticStage = 0;
-        rawDiagnosticFirstNibble = 0;
-        rawDiagnosticFirstRs = false;
-        rawDiagnosticFirstRw = false;
-        rawDiagnosticLastUs = 0;
-        rawCaptureRemaining = RAW_CAPTURE_EVENT_LIMIT;
-        __sync_synchronize();
-        rawCaptureEnabled = true;
+        armRawCapture();
         return;
     }
 
@@ -2627,9 +2799,9 @@ void initializeNetworkAndWeb()
                 releaseMomentaryButtons();
 
                 stage = 0;
+                readStage = 0;
                 firstNibble = 0;
                 lcdAddressSpace = LCD_SPACE_NONE;
-                cgramCandidateActive = false;
 
                 Serial.printf(
                     "HTTP update: %s\n",
@@ -2788,6 +2960,7 @@ void setup()
     Serial.begin(460800);
     setCpuFrequencyMhz(240);
 
+    memset(lcdDdram, ' ', sizeof(lcdDdram));
     memset(lcdScreen, ' ', sizeof(lcdScreen));
     memset(lcdCgram, 0, sizeof(lcdCgram));
     memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
@@ -2808,11 +2981,15 @@ void setup()
 
     pinMode(PIN_E, INPUT);
     pinMode(PIN_RS, INPUT);
-    pinMode(PIN_RW, INPUT_PULLUP);
+    pinMode(PIN_RW, INPUT);
     pinMode(PIN_DB4, INPUT);
     pinMode(PIN_DB5, INPUT);
     pinMode(PIN_DB6, INPUT);
     pinMode(PIN_DB7, INPUT);
+
+    // Сразу после загрузки ждём первые 512 импульсов E. Если тюнер пока
+    // выключен, пакет останется взведённым до его включения.
+    armRawCapture();
 
     const BaseType_t taskCreated = xTaskCreatePinnedToCore(
         TaskNetwork,
@@ -2829,16 +3006,12 @@ void setup()
         delay(1000);
         ESP.restart();
     }
-    Serial.println("LCD capture: LCD1602_CGRAM_Terminal_110 method");
+    Serial.println("LCD capture: raw first/last GPIO state while E=1");
     Serial.println("LCD R/W: pin 5 via 74LVC244A -> ESP32 GPIO16");
-    Serial.printf(
-        "Capture: delay=%lu CPU cycles, two reads, decode=s1\n",
-        (unsigned long)USER_CAPTURE_DELAY_CYCLES
-    );
-    Serial.println("Decoder: R/W=0 only, nibble-pair gap <= 5000 us");
+    Serial.println("RAW fields: D4..D7 + RS + R/W; no R/W filtering, no byte pairing");
+    Serial.println("Mirror experiment: every E pulse is treated as a write; R/W is observation only");
     Serial.println("Web LCD: atomic live snapshots, no frame-matching delay");
-    Serial.println("Nibble sync: RS mismatch re-arms from current nibble");
-    Serial.println("Raw BUS log: disabled until 512-event manual capture");
+    Serial.println("Raw BUS log: automatic 512-pulse capture after boot and POWER ON");
     Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
 }
 
@@ -2853,54 +3026,104 @@ void loop()
         return;
     }
 
-    if (REG_READ(GPIO_IN_REG) & MASK_E) {
-        // Это намеренно точная схема выборки пользовательского скетча
-        // LCD1602_CGRAM_Terminal_110: фиксированная задержка от момента,
-        // когда polling впервые увидел E=1, затем s1 и немедленно s2.
-        uint32_t start = xthal_get_ccount();
+    uint32_t detectedSample = REG_READ(GPIO_IN_REG);
 
-        while (
-            (uint32_t)(xthal_get_ccount() - start) <
-                USER_CAPTURE_DELAY_CYCLES
-        ) {
-            // Критический участок: ничего сюда не добавлять.
+    // Отдельно считаем любые замеченные переключения R/W, в том числе между
+    // импульсами E. Это помогает отличить постоянно зафиксированный уровень
+    // от линии, которую PIC временно переиспользует при опросе кнопок.
+    if (rawCaptureEnabled) {
+        bool observedRw = (detectedSample & MASK_RW) != 0;
+
+        if (!rawRwLevelKnown) {
+            rawRwPreviousLevel = observedRw;
+            rawRwLevelKnown = true;
         }
+        else if (observedRw != rawRwPreviousLevel) {
+            rawRwPreviousLevel = observedRw;
+            rawRwTransitionsAll++;
+        }
+    }
 
-        uint32_t s1 = REG_READ(GPIO_IN_REG);
-        uint32_t s2 = REG_READ(GPIO_IN_REG);
+    if (detectedSample & MASK_E) {
+        // HD44780/ST7066 фиксирует запись по спаду E. Данные обязаны быть
+        // установлены до этого спада, но после него гарантируются всего на
+        // время hold. Поэтому сохраняем КАЖДУЮ выборку с E=1 и используем
+        // последнюю из них — ближайшее программно наблюдаемое состояние
+        // непосредственно перед фиксирующим спадом. Здесь нет подобранной
+        // задержки, фильтра по длине импульса или выбора "лучшего" участка.
+        uint32_t firstHighSample = detectedSample;
+        uint32_t lastHighSample = detectedSample;
+        uint32_t firstLowSample = detectedSample & ~MASK_E;
+        uint32_t previousBus = detectedSample & MASK_LCD_BUS;
+        uint32_t changedBusMask = 0;
+        uint16_t highSampleCount = 1;
 
-        while (REG_READ(GPIO_IN_REG) & MASK_E) {
-            // Один импульс E обрабатывается ровно один раз.
+        for (;;) {
+            uint32_t currentSample = REG_READ(GPIO_IN_REG);
+
+            if ((currentSample & MASK_E) == 0) {
+                firstLowSample = currentSample;
+                break;
+            }
+
+            uint32_t currentBus = currentSample & MASK_LCD_BUS;
+
+            if (currentBus != previousBus) {
+                changedBusMask |= currentBus ^ previousBus;
+                previousBus = currentBus;
+            }
+
+            lastHighSample = currentSample;
+
+            if (highSampleCount != UINT16_MAX) {
+                highSampleCount++;
+            }
         }
 
         pulseCounter++;
         lastPulseAtMs = millis();
 
-        bool sampleUnstable =
-            ((s1 ^ s2) & MASK_LCD_BUS) != 0;
-
-        if (sampleUnstable) {
+        if (changedBusMask != 0) {
             sampleDifferenceCounter++;
         }
 
-        // Выборку всё равно декодируем, как в исходном скетче. Счётчик лишь
-        // показывает, сколько раз фиксированная задержка вышла за полку E.
-        if ((s1 & MASK_E) == 0) {
-            shortPulseDropCounter++;
+        // Это только диагностический счётчик. Протокол не разрешает
+        // отбрасывать легальный импульс из-за числа программных выборок.
+        if (highSampleCount == 1) {
+            singleSamplePulseCounter++;
         }
 
-        bool currentRw = (s1 & MASK_RW) != 0;
-        bool currentRs = (s1 & MASK_RS) != 0;
-        uint8_t nibble = readNibble(s1);
+        bool currentRw = (lastHighSample & MASK_RW) != 0;
+        bool currentRs = (lastHighSample & MASK_RS) != 0;
+        uint8_t nibble = readNibble(lastHighSample);
         uint32_t capturedAtUs = micros();
 
+        if (currentRw) {
+            lcdReadPulseCounter++;
+        }
+        else {
+            lcdWritePulseCounter++;
+        }
+
+        if (decoderResetRequested) {
+            decoderResetRequested = false;
+            stage = 0;
+            readStage = 0;
+            firstNibble = 0;
+            firstNibbleRs = currentRs;
+            readFirstNibble = 0;
+            readFirstNibbleRs = currentRs;
+            fourBitModeSeen = false;
+        }
+
         if (rawCaptureEnabled) {
-            recordRawNibble(
-                nibble,
-                currentRs,
-                currentRw,
-                capturedAtUs,
-                sampleUnstable
+            recordRawPulse(
+                firstHighSample,
+                lastHighSample,
+                firstLowSample,
+                changedBusMask,
+                highSampleCount,
+                capturedAtUs
             );
 
             uint16_t remaining = rawCaptureRemaining;
@@ -2911,27 +3134,15 @@ void loop()
             }
 
             if (remaining == 0) {
+                rawSummaryPending = true;
                 __sync_synchronize();
                 rawCaptureEnabled = false;
             }
         }
 
-        if (currentRw) {
-            lcdReadPulseCounter++;
-
-            // Чтение busy/address не может находиться между двумя половинами
-            // одной записи. Если запись осталась недособранной, её граница
-            // уже потеряна и переносить этот полубайт через чтение нельзя.
-            if (stage != 0) {
-                stage = 0;
-                readBoundaryResetCounter++;
-            }
-
-            return;
-        }
-
-        lcdWritePulseCounter++;
-
+        // Экспериментальная копия экрана не использует R/W вообще. Это не
+        // часть сырого измерения: даже если зеркало ошибочно, RAW-пакет выше
+        // остаётся буквальной записью состояний линий на каждом импульсе E.
         processCapturedNibble(
             nibble,
             currentRs,
