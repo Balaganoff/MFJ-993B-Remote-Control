@@ -2,7 +2,9 @@
 
 ## 2026-09-30
 
-- Reject LCD samples unless both immediate reads agree and `E` remains high.
+- Version 1.2.1: accept the measured short `E` pulse while still requiring both immediate RS/DB4-DB7 reads to agree; this fixes the blank browser LCD introduced by the over-strict `E` gate.
+- Added `GET /status` and a WebSocket `FW:<version>` greeting for remote post-OTA verification.
+- Reject LCD samples unless both immediate RS/DB4-DB7 reads agree.
 - Recover nibble phase only at an unambiguous RS command/data boundary after a rejected pulse.
 - Added WebSocket command `R` for a capture-only reset and `LCD_RESET_OK` acknowledgement.
 - The capture reset never changes button GPIOs or tuner power and preserves CGRAM during a manual reset.
