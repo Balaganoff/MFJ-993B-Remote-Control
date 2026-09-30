@@ -39,6 +39,9 @@ const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 const uint32_t DISPLAY_IDLE_US = 2000;
 
+const char FIRMWARE_VERSION[] =
+    "2026.09.30-lcd-resync-v1.2.1";
+
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
     (1U << 1) |
@@ -137,7 +140,6 @@ volatile uint32_t rejectedDataCounter = 0;
 volatile uint32_t timeoutCounter = 0;
 volatile uint32_t rsResetCounter = 0;
 volatile uint32_t sampleDifferenceCounter = 0;
-volatile uint32_t lateSampleCounter = 0;
 volatile uint32_t decoderResyncCounter = 0;
 
 // ============================================================================
@@ -1683,6 +1685,15 @@ void handleWebSocketEvent(
 ) {
     if (type == WS_EVT_CONNECT) {
         lcdPushForceInitial = true;
+
+        char firmwareHello[64];
+        snprintf(
+            firmwareHello,
+            sizeof(firmwareHello),
+            "FW:%s",
+            FIRMWARE_VERSION
+        );
+        client->text(firmwareHello);
         return;
     }
 
@@ -1899,6 +1910,40 @@ void setup()
         ESP.restart();
     });
 
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        char statusJson[320];
+
+        snprintf(
+            statusJson,
+            sizeof(statusJson),
+            "{\"firmware\":\"%s\","
+            "\"uptime_ms\":%lu,"
+            "\"lcd_version\":%lu,"
+            "\"pulses\":%lu,"
+            "\"sample_mismatch\":%lu,"
+            "\"decoder_resync\":%lu}",
+            FIRMWARE_VERSION,
+            (unsigned long)millis(),
+            (unsigned long)lcdVersion,
+            (unsigned long)pulseCounter,
+            (unsigned long)sampleDifferenceCounter,
+            (unsigned long)decoderResyncCounter
+        );
+
+        AsyncWebServerResponse *response =
+            request->beginResponse(
+                200,
+                "application/json; charset=utf-8",
+                statusJson
+            );
+
+        response->addHeader(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        );
+        request->send(response);
+    });
+
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncWebServerResponse *response =
             request->beginResponse_P(
@@ -2025,7 +2070,8 @@ void setup()
         0
     );
 
-    Serial.println("LCD capture: SAMPLE_DELAY=90, stable samples only");
+    Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.println("LCD capture: SAMPLE_DELAY=90, matching bus samples only");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
     Serial.println("Nibble sync: RS-boundary recovery + remote R reset");
 }
@@ -2064,27 +2110,16 @@ void loop()
         bool sampleChanged =
             ((s1 ^ s2) & MASK_LCD_BUS) != 0;
 
-        bool sampleLate =
-            (s1 & MASK_E) == 0 ||
-            (s2 & MASK_E) == 0;
+        if (sampleChanged) {
+            sampleDifferenceCounter++;
 
-        if (sampleChanged || sampleLate) {
             bool rsKnown =
                 ((s1 ^ s2) & MASK_RS) == 0;
 
             bool sampledRs =
                 (s2 & MASK_RS) != 0;
 
-            if (sampleChanged) {
-                sampleDifferenceCounter++;
-            }
-
-            if (sampleLate) {
-                lateSampleCounter++;
-            }
-
-            // Главное отличие от старого кода: сомнительный nibble больше
-            // никогда не попадает в декодер и не может сдвинуть весь экран.
+            // Сомнительный nibble никогда не попадает в декодер.
             markDecoderDesynchronized(
                 rsKnown,
                 sampledRs
@@ -2092,6 +2127,11 @@ void loop()
             return;
         }
 
+        // Уровень E здесь намеренно не проверяется. На реальном MFJ его
+        // короткий импульс может закончиться к моменту SAMPLE_DELAY, тогда
+        // как RS/D4..D7 ещё стабильны по времени удержания. Требование E=1
+        // отбрасывало почти все корректные передачи и оставляло Web LCD
+        // пустым. Достоверность определяет совпадение двух чтений шины.
         uint32_t reg = s2;
 
         bool currentRs = (reg & MASK_RS) != 0;
