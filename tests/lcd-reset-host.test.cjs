@@ -9,6 +9,19 @@ const source = fs.readFileSync(path.join(
   'firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino'
 ), 'utf8');
 
+assert.doesNotMatch(
+  source,
+  /sampleLate|lateSampleCounter/,
+  'short valid E pulses must not be rejected after the delayed bus sample'
+);
+assert.match(
+  source,
+  /if \(sampleChanged\)[\s\S]*?markDecoderDesynchronized\([\s\S]*?return;/,
+  'mismatched bus samples must desynchronize and return before decoding'
+);
+assert.match(source, /"\/status"/);
+assert.match(source, /FW:%s/);
+
 const config = source.slice(
   source.indexOf('const uint8_t BTN_PINS'),
   source.indexOf('// WEB / WIFI /')
