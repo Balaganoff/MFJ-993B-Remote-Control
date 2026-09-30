@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 
 
 APP_NAME = "MFJ-993B Companion"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_HOST = "192.168.2.124"
 
 MIN_UI_SCALE = 0.60
@@ -45,6 +45,7 @@ SPACE = 0x20
 LCD_RESET_COMMAND = "R"
 LCD_RESET_ACK = "LCD_RESET_OK"
 LCD_RESET_TIMEOUT_MS = 1500
+FIRMWARE_PREFIX = "FW:"
 
 MOMENTARY_INDICES = (1, 2, 4, 5, 6, 7)
 MOMENTARY_MASK = sum(1 << index for index in MOMENTARY_INDICES)
@@ -1046,7 +1047,15 @@ class CompanionApp:
         )
 
     def _handle_text_message(self, message: str) -> None:
-        if message.strip() != LCD_RESET_ACK:
+        text = message.strip()
+
+        if text.startswith(FIRMWARE_PREFIX):
+            version = text[len(FIRMWARE_PREFIX):].strip()
+            if version:
+                self.status_var.set(f"ESP32: {version}")
+            return
+
+        if text != LCD_RESET_ACK:
             return
 
         self._cancel_reset_ack_wait()
@@ -1515,8 +1524,12 @@ class CompanionApp:
         if event_type == "ota_progress":
             self.status_var.set(f"Передача прошивки: {payload}%")
         elif event_type == "ota_done":
-            self.status_var.set("Прошивка передана. ESP32 перезагружается…")
-            messagebox.showinfo("Обновление завершено", str(payload), parent=self.config_window or self.root)
+            self.status_var.set("Прошивка принята. Ждём перезапуск и номер версии ESP32…")
+            messagebox.showinfo(
+                "Обновление завершено",
+                f"{payload}\n\nПосле переподключения версия ESP32 появится в окне CONFIG.",
+                parent=self.config_window or self.root,
+            )
         elif event_type == "ota_error":
             self.status_var.set("Ошибка обновления")
             messagebox.showerror("Ошибка обновления", str(payload), parent=self.config_window or self.root)
