@@ -99,6 +99,15 @@ uint32_t lcdPushLastVersion = 0;
 bool cgramCandidateActive = false;
 uint32_t cgramCandidateLastUs = 0;
 
+// Запрос сброса приходит с сетевого ядра, а исполняется только ядром
+// захвата. Это не трогает GPIO кнопок и питание тюнера.
+const uint8_t LCD_RESET_CLEAR_DDRAM = 0x01;
+const uint8_t LCD_RESET_CLEAR_CGRAM = 0x02;
+const uint8_t LCD_RESET_SEND_ACK    = 0x80;
+
+volatile uint8_t lcdResetRequestFlags = 0;
+volatile bool lcdResetAckPending = false;
+
 // ============================================================================
 // СБОРКА БАЙТА
 // ============================================================================
@@ -107,6 +116,13 @@ uint8_t stage = 0;
 uint8_t firstNibble = 0;
 bool lastRs = false;
 uint32_t lastBusTime = 0;
+
+// После потерянного/сомнительного импульса нельзя просто принять следующий
+// nibble: он может оказаться младшей половиной байта. Ждём смену RS — на
+// границе command/data первая половина снова однозначно старшая.
+bool decoderNeedsRsBoundary = true;
+bool observedRsValid = false;
+bool observedRs = false;
 
 // ============================================================================
 // ВНУТРЕННИЕ СЧЁТЧИКИ ЗАХВАТА
@@ -121,6 +137,8 @@ volatile uint32_t rejectedDataCounter = 0;
 volatile uint32_t timeoutCounter = 0;
 volatile uint32_t rsResetCounter = 0;
 volatile uint32_t sampleDifferenceCounter = 0;
+volatile uint32_t lateSampleCounter = 0;
+volatile uint32_t decoderResyncCounter = 0;
 
 // ============================================================================
 // ОСНОВНАЯ WEB-СТРАНИЦА
@@ -1399,6 +1417,34 @@ static inline void processCapturedNibble(
     bool currentRs,
     uint32_t now
 ) {
+    if (decoderNeedsRsBoundary) {
+        if (!observedRsValid) {
+            observedRs = currentRs;
+            observedRsValid = true;
+            lastBusTime = now;
+            return;
+        }
+
+        if (currentRs == observedRs) {
+            lastBusTime = now;
+            return;
+        }
+
+        // Смена RS сама является надёжной границей байта. Текущий nibble —
+        // первая (старшая) половина первого байта нового участка.
+        decoderNeedsRsBoundary = false;
+        observedRs = currentRs;
+        lastRs = currentRs;
+        lastBusTime = now;
+        firstNibble = nibble;
+        stage = 1;
+        decoderResyncCounter++;
+        return;
+    }
+
+    observedRs = currentRs;
+    observedRsValid = true;
+
     if (
         lastBusTime != 0 &&
         (uint32_t)(now - lastBusTime) > NIBBLE_TIMEOUT_US
@@ -1432,25 +1478,77 @@ static inline void processCapturedNibble(
     processByte(value, currentRs, now);
 }
 
+static inline void markDecoderDesynchronized(
+    bool rsKnown,
+    bool currentRs
+) {
+    stage = 0;
+    firstNibble = 0;
+    lcdAddressSpace = LCD_SPACE_NONE;
+    cgramCandidateActive = false;
+    decoderNeedsRsBoundary = true;
+    observedRsValid = rsKnown;
+    observedRs = currentRs;
+}
+
 // ============================================================================
 // КНОПКИ
 // ============================================================================
 
-void clearCapturedLcdBeforePowerOn()
+void requestLcdCaptureReset(
+    bool clearCgram,
+    bool sendAck
+)
 {
     portENTER_CRITICAL(&lcdMux);
 
-    memset(lcdScreen, ' ', sizeof(lcdScreen));
-    memset(lcdCgram, 0, sizeof(lcdCgram));
-    memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
-    lcdVersion++;
-    lastDdramChangeUs = micros();
+    lcdResetRequestFlags |= LCD_RESET_CLEAR_DDRAM;
+
+    if (clearCgram) {
+        lcdResetRequestFlags |= LCD_RESET_CLEAR_CGRAM;
+    }
+
+    if (sendAck) {
+        lcdResetRequestFlags |= LCD_RESET_SEND_ACK;
+    }
+
+    portEXIT_CRITICAL(&lcdMux);
+}
+
+static inline void serviceLcdCaptureReset()
+{
+    uint8_t flags = 0;
+
+    portENTER_CRITICAL(&lcdMux);
+
+    flags = lcdResetRequestFlags;
+    lcdResetRequestFlags = 0;
+
+    if (flags != 0) {
+        memset(lcdScreen, ' ', sizeof(lcdScreen));
+
+        // При ручной ресинхронизации CGRAM сохраняем: PIC обычно загружает
+        // пользовательские символы только при старте и может их не повторить.
+        if (flags & LCD_RESET_CLEAR_CGRAM) {
+            memset(lcdCgram, 0, sizeof(lcdCgram));
+            memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
+        }
+
+        lcdVersion++;
+        lastDdramChangeUs = micros();
+    }
 
     portEXIT_CRITICAL(&lcdMux);
 
+    if (flags == 0) {
+        return;
+    }
+
+    bool hadStableBusState = lastBusTime != 0;
+    bool previousRs = lastRs;
+
     stage = 0;
     firstNibble = 0;
-    lastRs = false;
     lastBusTime = 0;
 
     lcdAddress = 0;
@@ -1460,6 +1558,17 @@ void clearCapturedLcdBeforePowerOn()
 
     cgramCandidateActive = false;
     cgramCandidateLastUs = 0;
+
+    decoderNeedsRsBoundary = true;
+    observedRsValid = hadStableBusState;
+    observedRs = previousRs;
+
+    lcdPushForceInitial = true;
+    decoderResyncCounter++;
+
+    if (flags & LCD_RESET_SEND_ACK) {
+        lcdResetAckPending = true;
+    }
 }
 
 void applyButtonMask(uint16_t newMask)
@@ -1473,7 +1582,9 @@ void applyButtonMask(uint16_t newMask)
         (newMask & (1U << 8)) != 0;
 
     if (!powerWasOn && powerWillBeOn) {
-        clearCapturedLcdBeforePowerOn();
+        // Полный сброс здесь нужен только потому, что после настоящего
+        // включения PIC заново загрузит и DDRAM, и CGRAM.
+        requestLcdCaptureReset(true, false);
     }
 
     for (uint8_t i = 0; i < 9; i++) {
@@ -1614,6 +1725,17 @@ void handleWebSocketEvent(
         }
 
         applyButtonMask(newMask);
+        return;
+    }
+
+    // Безопасный сброс только программной копии и автомата декодера.
+    // Ни один GPIO кнопок, включая POWER, здесь не изменяется.
+    if (
+        length == 1 &&
+        data[0] == 'R' &&
+        !webUpdateInProgress
+    ) {
+        requestLcdCaptureReset(false, true);
     }
 }
 
@@ -1647,6 +1769,11 @@ void TaskWeb(void *parameter)
 
         if (!webUpdateInProgress && !webUpdateRestartPending) {
             pushLcdSnapshotIfReady();
+        }
+
+        if (lcdResetAckPending) {
+            lcdResetAckPending = false;
+            ws.textAll("LCD_RESET_OK");
         }
 
         if ((uint32_t)(now - lastCleanupMs) >= 5000) {
@@ -1898,9 +2025,9 @@ void setup()
         0
     );
 
-    Serial.println("LCD capture: SAMPLE_DELAY=90, capture=s1");
+    Serial.println("LCD capture: SAMPLE_DELAY=90, stable samples only");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
-    Serial.println("Nibble sync: reset incomplete byte only");
+    Serial.println("Nibble sync: RS-boundary recovery + remote R reset");
 }
 
 // ============================================================================
@@ -1909,6 +2036,8 @@ void setup()
 
 void loop()
 {
+    serviceLcdCaptureReset();
+
     if (webUpdateInProgress || webUpdateRestartPending) {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -1926,20 +2055,44 @@ void loop()
         uint32_t s1 = REG_READ(GPIO_IN_REG);
         uint32_t s2 = REG_READ(GPIO_IN_REG);
 
-        uint32_t reg = s1;
-
         while (REG_READ(GPIO_IN_REG) & MASK_E) {
             // Один импульс E обрабатывается ровно один раз.
         }
 
         pulseCounter++;
 
-        bool sampleUnstable =
+        bool sampleChanged =
             ((s1 ^ s2) & MASK_LCD_BUS) != 0;
 
-        if (sampleUnstable) {
-            sampleDifferenceCounter++;
+        bool sampleLate =
+            (s1 & MASK_E) == 0 ||
+            (s2 & MASK_E) == 0;
+
+        if (sampleChanged || sampleLate) {
+            bool rsKnown =
+                ((s1 ^ s2) & MASK_RS) == 0;
+
+            bool sampledRs =
+                (s2 & MASK_RS) != 0;
+
+            if (sampleChanged) {
+                sampleDifferenceCounter++;
+            }
+
+            if (sampleLate) {
+                lateSampleCounter++;
+            }
+
+            // Главное отличие от старого кода: сомнительный nibble больше
+            // никогда не попадает в декодер и не может сдвинуть весь экран.
+            markDecoderDesynchronized(
+                rsKnown,
+                sampledRs
+            );
+            return;
         }
+
+        uint32_t reg = s2;
 
         bool currentRs = (reg & MASK_RS) != 0;
         uint8_t nibble = readNibble(reg);
