@@ -202,6 +202,12 @@ class ResetCaptureTests(unittest.TestCase):
         self.assertFalse(app.reset_waiting)
         self.assertEqual(app.root.cancelled, ["reset-job"])
 
+        app._handle_text_message("FW:2026.09.30-lcd-resync-v1.2.1")
+        self.assertEqual(
+            app.status_var.value,
+            "ESP32: 2026.09.30-lcd-resync-v1.2.1",
+        )
+
 
 class ModeTransitionTests(unittest.TestCase):
     def test_live_mode_updates_do_not_restart_transition_timer(self) -> None:
