@@ -14,14 +14,14 @@ The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency
 
 1. Core 1 watches `GPIO_IN_REG` for LCD `E` high.
 2. After `SAMPLE_DELAY = 90` CPU cycles, two immediate RS/DB4-DB7 samples are taken.
-3. Both samples must still have `E` high and must agree on RS/DB4-DB7. A late or changing sample is rejected and never reaches the byte decoder.
+3. Both samples must agree on RS/DB4-DB7. A changing sample is rejected and never reaches the byte decoder. `E` is intentionally not required to remain high: on the measured MFJ bus its short pulse may end before the delayed sample while RS/data are still valid during their hold time.
 4. After a rejected pulse, the decoder discards the partial byte and waits for an RS transition. The command/data boundary makes the next nibble unambiguously the high nibble of a new byte.
 5. A normal gap longer than 5000 µs or an RS change discards only an incomplete nibble pair.
 6. Commands handle clear, home, entry direction, visible DDRAM addresses and CGRAM addresses.
 7. The visible DDRAM ranges are `0x00-0x0F` and `0x40-0x4F`.
 8. CGRAM stores eight custom 5x8 glyphs: 64 rows in total. A row update preserves the other seven rows exactly as the LCD controller does.
 
-The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. The second sample and the `E` check prevent a late poll from poisoning the persistent virtual LCD state.
+The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. The second matching bus sample prevents a changing poll from poisoning the persistent virtual LCD state. Requiring `E=1` at that point is explicitly avoided because it rejects valid pulses on this tuner.
 
 ## Snapshot readiness
 
@@ -91,6 +91,8 @@ Button order:
 
 ### ESP32 to browser
 
+On every WebSocket connection the firmware sends `FW:2026.09.30-lcd-resync-v1.2.1`, allowing remote clients to confirm the running image without a serial terminal.
+
 #### LCD snapshot — 98 bytes
 
 | Offset | Size | Content |
@@ -116,6 +118,7 @@ There is no WebSocket command for firmware-update mode in the current version.
 |---|---|---|
 | `GET` | `/` | Main remote-control page, or Wi-Fi form in configuration AP mode |
 | `POST` | `/save` | Store Wi-Fi form fields `s` and `p`, then restart |
+| `GET` | `/status` | Firmware version, uptime and LCD-capture counters as JSON |
 | `GET` | `/update` | Firmware upload page |
 | `POST` | `/update` | Stream the selected application image to the ESP32 update partition |
 | WebSocket | `/ws` | LCD snapshots and button states |
