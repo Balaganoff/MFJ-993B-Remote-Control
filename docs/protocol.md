@@ -13,17 +13,15 @@ The browser normally renders the captured LCD directly. Only the recognized main
 The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency.
 
 1. Core 1 watches `GPIO_IN_REG` for LCD `E` high.
-2. After `SAMPLE_DELAY = 110` CPU cycles, RS and DB4-DB7 are read from one GPIO register sample.
-3. The loop waits for `E` low so one enable pulse is handled once.
-4. Two nibbles with the same RS state are combined into one byte.
-5. A gap longer than 5000 µs or an RS change discards only an incomplete nibble pair. Previously accepted LCD state and the selected address space are preserved.
+2. After `SAMPLE_DELAY = 90` CPU cycles, two immediate RS/DB4-DB7 samples are taken.
+3. Both samples must still have `E` high and must agree on RS/DB4-DB7. A late or changing sample is rejected and never reaches the byte decoder.
+4. After a rejected pulse, the decoder discards the partial byte and waits for an RS transition. The command/data boundary makes the next nibble unambiguously the high nibble of a new byte.
+5. A normal gap longer than 5000 µs or an RS change discards only an incomplete nibble pair.
 6. Commands handle clear, home, entry direction, visible DDRAM addresses and CGRAM addresses.
 7. The visible DDRAM ranges are `0x00-0x0F` and `0x40-0x4F`.
 8. CGRAM stores eight custom 5x8 glyphs: 64 rows in total. A row update preserves the other seven rows exactly as the LCD controller does.
 
-The second immediate GPIO sample is diagnostic only. A difference increments an internal counter but does not replace the first sample or roll back an entire run.
-
-The 110-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test.
+The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. The second sample and the `E` check prevent a late poll from poisoning the persistent virtual LCD state.
 
 ## Snapshot readiness
 
@@ -82,6 +80,7 @@ Endpoint: `/ws`
 |---|---|---|
 | LCD request | ASCII `L` | Request one current DDRAM+CGRAM snapshot |
 | Buttons | ASCII `Bxxxxxxxxx` | Nine `0`/`1` states in `BTN_PINS[]` order |
+| Safe capture reset | ASCII `R` | Clear virtual DDRAM and reset the capture decoder without changing any button GPIO or tuner power |
 
 Button order:
 
@@ -104,6 +103,10 @@ Button order:
 #### Wait response — 1 byte
 
 `0xFC` means DDRAM changed less than 12 ms ago. The browser clears the pending request and retries after 12 ms. It is flow control, not an LCD frame.
+
+#### Capture-reset acknowledgement
+
+After core 1 has executed command `R`, the ESP32 sends the text message `LCD_RESET_OK`. A manual reset clears virtual DDRAM but deliberately preserves CGRAM because the tuner may upload custom glyphs only at power-up. It resets no physical output and performs no POWER OFF/ON operation.
 
 There is no WebSocket command for firmware-update mode in the current version.
 
