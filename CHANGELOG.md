@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-30
+
+- Reject LCD samples unless both immediate reads agree and `E` remains high.
+- Recover nibble phase only at an unambiguous RS command/data boundary after a rejected pulse.
+- Added WebSocket command `R` for a capture-only reset and `LCD_RESET_OK` acknowledgement.
+- The capture reset never changes button GPIOs or tuner power and preserves CGRAM during a manual reset.
+- Added host regression coverage for reset, CGRAM preservation, power-mask preservation and RS-boundary recovery.
+
 ## 2026-09-11
 
 - Replaced Arduino IDE network-port update mode with browser upload at `/update`.
