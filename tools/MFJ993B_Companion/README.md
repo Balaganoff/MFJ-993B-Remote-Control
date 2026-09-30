@@ -1,6 +1,6 @@
-# MFJ-993B Companion v1.2.0
+# MFJ-993B Companion v1.2.1
 
-Native Tkinter client for Windows x64. It uses the firmware WebSocket endpoint directly and does not embed a browser.
+Native Tkinter client for Windows x64. It uses the firmware WebSocket endpoint directly and does not embed a browser. Version 1.2.1 shows the firmware actually running on the remote ESP32 after every connection and OTA restart.
 
 ## Run from source
 
@@ -18,6 +18,7 @@ No third-party Python packages are required.
 - Client to ESP32: `Bxxxxxxxxx` for the nine button states.
 - Safe LCD capture reset: text command `R`.
 - Reset acknowledgement: text message `LCD_RESET_OK`.
+- Firmware identity after connection: `FW:<version>`.
 
 `RESET LCD` does **not** toggle POWER or any other tuner input. It clears the client's local formatter state and asks core 1 of the ESP32 to reset only the capture decoder. The firmware preserves CGRAM and waits for a clean RS command/data boundary before accepting more nibbles.
 
