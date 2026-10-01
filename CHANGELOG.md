@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-01
+
+- Version 1.2.2 restores the measured capture path: the first delayed sample `s1` drives the decoder and `s2` is diagnostic only.
+- An `s1`/`s2` disagreement no longer deletes a nibble, clears the LCD address state or locks the decoder until an RS transition.
+- Timeout, RS-change and manual reset recovery now discard only an incomplete byte; manual reset still never changes POWER or button GPIOs.
+- `/status` now exposes byte, address-command, accepted/rejected-data, timeout, RS-reset and live decoder-state counters.
+- Added regression coverage for the proven first-sample path and non-destructive capture recovery.
+
 ## 2026-09-30
 
 - Version 1.2.1: accept the measured short `E` pulse while still requiring both immediate RS/DB4-DB7 reads to agree; this fixes the blank browser LCD introduced by the over-strict `E` gate.

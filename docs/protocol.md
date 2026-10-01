@@ -13,15 +13,15 @@ The browser normally renders the captured LCD directly. Only the recognized main
 The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency.
 
 1. Core 1 watches `GPIO_IN_REG` for LCD `E` high.
-2. After `SAMPLE_DELAY = 90` CPU cycles, two immediate RS/DB4-DB7 samples are taken.
-3. Both samples must agree on RS/DB4-DB7. A changing sample is rejected and never reaches the byte decoder. `E` is intentionally not required to remain high: on the measured MFJ bus its short pulse may end before the delayed sample while RS/data are still valid during their hold time.
-4. After a rejected pulse, the decoder discards the partial byte and waits for an RS transition. The command/data boundary makes the next nibble unambiguously the high nibble of a new byte.
-5. A normal gap longer than 5000 µs or an RS change discards only an incomplete nibble pair.
+2. After `SAMPLE_DELAY = 90` CPU cycles, the proven first RS/DB4-DB7 sample `s1` is captured; an immediate `s2` is retained only as a timing diagnostic.
+3. `s1` always enters the nibble decoder. Rejecting an `s1`/`s2` disagreement removes a real nibble from this short-E bus and shifts every following byte in the current LCD block.
+4. `E` is intentionally not required to remain high at the delayed sample: RS/data remain valid during their hold time after the measured short pulse ends.
+5. A normal gap longer than 5000 µs or an RS change discards only an incomplete nibble pair. It does not erase the last accepted DDRAM/CGRAM address state.
 6. Commands handle clear, home, entry direction, visible DDRAM addresses and CGRAM addresses.
 7. The visible DDRAM ranges are `0x00-0x0F` and `0x40-0x4F`.
 8. CGRAM stores eight custom 5x8 glyphs: 64 rows in total. A row update preserves the other seven rows exactly as the LCD controller does.
 
-The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. The second matching bus sample prevents a changing poll from poisoning the persistent virtual LCD state. Requiring `E=1` at that point is explicitly avoided because it rejects valid pulses on this tuner.
+The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. On the measured installation `s1` is the validated sample; `s2` counts boundary movement but never removes the corresponding nibble. Requiring `E=1` or requiring `s1 == s2` at that point rejects valid pulses on this tuner.
 
 ## Snapshot readiness
 
@@ -91,7 +91,7 @@ Button order:
 
 ### ESP32 to browser
 
-On every WebSocket connection the firmware sends `FW:2026.09.30-lcd-resync-v1.2.1`, allowing remote clients to confirm the running image without a serial terminal.
+On every WebSocket connection the firmware sends `FW:2026.10.01-lcd-resync-v1.2.2`, allowing remote clients to confirm the running image without a serial terminal.
 
 #### LCD snapshot — 98 bytes
 
@@ -118,7 +118,7 @@ There is no WebSocket command for firmware-update mode in the current version.
 |---|---|---|
 | `GET` | `/` | Main remote-control page, or Wi-Fi form in configuration AP mode |
 | `POST` | `/save` | Store Wi-Fi form fields `s` and `p`, then restart |
-| `GET` | `/status` | Firmware version, uptime and LCD-capture counters as JSON |
+| `GET` | `/status` | Firmware version, uptime, capture pipeline counters and current decoder state as JSON |
 | `GET` | `/update` | Firmware upload page |
 | `POST` | `/update` | Stream the selected application image to the ESP32 update partition |
 | WebSocket | `/ws` | LCD snapshots and button states |

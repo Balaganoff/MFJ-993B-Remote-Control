@@ -6,7 +6,7 @@ const {spawnSync} = require('node:child_process');
 const root = path.resolve(__dirname, '..');
 const source = fs.readFileSync(path.join(
   root,
-  'firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino'
+  'MFJ993B_Companion_Win64_v1.2.2/firmware_source/MFJ993B_Remote_Control.ino'
 ), 'utf8');
 
 assert.doesNotMatch(
@@ -16,10 +16,21 @@ assert.doesNotMatch(
 );
 assert.match(
   source,
-  /if \(sampleChanged\)[\s\S]*?markDecoderDesynchronized\([\s\S]*?return;/,
-  'mismatched bus samples must desynchronize and return before decoding'
+  /if \(sampleChanged\) \{\s*sampleDifferenceCounter\+\+;\s*\}/,
+  's1/s2 disagreement must remain diagnostic only'
+);
+assert.match(
+  source,
+  /uint32_t reg = s1;/,
+  'the proven first sample s1 must drive the decoder'
+);
+assert.doesNotMatch(
+  source,
+  /markDecoderDesynchronized|decoderNeedsRsBoundary|observedRsValid/,
+  'a diagnostic mismatch must not lock out the following LCD block'
 );
 assert.match(source, /"\/status"/);
+assert.match(source, /"\\"accepted_data\\":%lu,"/);
 assert.match(source, /FW:%s/);
 
 const config = source.slice(
@@ -57,10 +68,7 @@ const cases = String.raw`
 int main()
 {
     volatile uint16_t beforeMask = buttonMask;
-    decoderNeedsRsBoundary = false;
-    observedRsValid = true;
     lastRs = true;
-    observedRs = true;
     lastBusTime = 500;
 
     lcdCgram[3][4] = 0x15;
@@ -78,8 +86,10 @@ int main()
     assert(lcdCgram[3][4] == 0x15);
     assert(lcdCgramKnownRows[3] == (1U << 4));
     assert(lcdResetAckPending);
-    assert(decoderNeedsRsBoundary);
-    assert(observedRsValid && observedRs);
+    assert(stage == 0);
+    assert(lastBusTime == 0);
+    assert(lcdAddressSpace == LCD_SPACE_NONE);
+    assert(captureResetCounter == 1);
 
     processCapturedNibble(0x8, false, 700);
     processCapturedNibble(0x0, false, 701);
@@ -88,14 +98,13 @@ int main()
     processCapturedNibble(0x1, true, 703);
     assert(lcdScreen[0] == 'A');
 
-    markDecoderDesynchronized(true, true);
-    processCapturedNibble(0x4, true, 800);
-    processCapturedNibble(0x2, true, 801);
-    assert(lcdScreen[0] == 'A');
-    processCapturedNibble(0x8, false, 802);
-    processCapturedNibble(0x0, false, 803);
-    processCapturedNibble(0x4, true, 804);
-    processCapturedNibble(0x2, true, 805);
+    // A long gap drops only the unfinished nibble. The valid DDRAM address
+    // remains usable, matching the physical HD44780 state.
+    processCommand(0x80, 800);
+    processCapturedNibble(0x4, true, 801);
+    processCapturedNibble(0x4, true, 7000);
+    assert(lcdAddressSpace == LCD_SPACE_DDRAM && lcdAddress == 0);
+    processCapturedNibble(0x2, true, 7001);
     assert(lcdScreen[0] == 'B');
 
     requestLcdCaptureReset(true, false);
@@ -103,7 +112,7 @@ int main()
     assert(lcdCgram[3][4] == 0);
     assert(lcdCgramKnownRows[3] == 0);
 
-    std::cout << "LCD reset/resync host tests: PASS\n";
+    std::cout << "LCD reset/stable-capture host tests: PASS\n";
 }
 `;
 

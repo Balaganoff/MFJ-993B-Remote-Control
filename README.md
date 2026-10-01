@@ -71,7 +71,7 @@ However, the following items must be measured and adapted separately:
 
 Do not use this repository's MFJ-993B wiring table or firmware unchanged on an MFJ-998-class tuner. The MFJ-998 is a legal-limit device; disconnect the amplifier, transmitter, antennas and power before any internal work.
 
-The capture loop runs on ESP32 core 1 at 240 MHz. It samples `GPIO_IN_REG` 110 CPU cycles after LCD `E` is observed high and combines two 4-bit transfers into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction and all eight custom characters.
+The capture loop runs on ESP32 core 1 at 240 MHz. It samples `GPIO_IN_REG` 90 CPU cycles after LCD `E` is observed high and combines two 4-bit transfers into one command or data byte. The decoder tracks visible DDRAM addresses, CGRAM address writes, entry direction and all eight custom characters.
 
 Networking and housekeeping run on core 0. The browser requests the next snapshot only after the previous response, so slow Wi-Fi or a VPN cannot build a queue of obsolete screens. Button commands are sent immediately.
 
@@ -240,7 +240,7 @@ ESP32 пассивно считывает шину дисплея, восста�
 
 PIC16F76 соединён с совместимым с HD44780 дисплеем LCD1602 по 4-битной шине `RS`, `E`, `DB4…DB7`. На проверенном тюнере в паузе `E` имеет низкий уровень, остальные наблюдаемые линии — высокий. PIC передаёт команды и изменившиеся данные короткими пакетами, а не повторяет весь экран постоянно: состояние DDRAM и CGRAM хранится самим контроллером LCD.
 
-Измеренная длительность высокого уровня `E` — около 520 нс. Остальные линии устойчивы примерно 1–2 мкс; короткий переходный звон до 0,5 В длится лишь 10–20 нс. По протоколу LCD фиксирует записываемые данные по спаду `E`, а ESP32 делает одну одновременную выборку линий после задержки `110` тактов CPU.
+Измеренная длительность высокого уровня `E` — около 520 нс. Остальные линии устойчивы примерно 1–2 мкс; короткий переходный звон до 0,5 В длится лишь 10–20 нс. По протоколу LCD фиксирует записываемые данные по спаду `E`, а ESP32 делает одну одновременную выборку линий после задержки `90` тактов CPU.
 
 Шесть сигналов LCD проходят через 74LVC244A с питанием 3,3 В. В обратном направлении восемь выходов ESP32 включают PC817, распаянные параллельно штатным кнопкам. Девятая PC817 управляет отдельным драйвером реле питания. Поэтому веб-интерфейс может нажимать обычные кнопки, удерживать их и выполнять комбинации настроек, тестов и сброса.
 

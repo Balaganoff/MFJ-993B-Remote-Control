@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 
 
 APP_NAME = "MFJ-993B Companion"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 DEFAULT_HOST = "192.168.2.124"
 
 MIN_UI_SCALE = 0.60

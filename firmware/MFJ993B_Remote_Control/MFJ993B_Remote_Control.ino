@@ -40,7 +40,7 @@ const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 const uint32_t DISPLAY_IDLE_US = 2000;
 
 const char FIRMWARE_VERSION[] =
-    "2026.09.30-lcd-resync-v1.2.1";
+    "2026.10.01-lcd-resync-v1.2.2";
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
@@ -120,13 +120,6 @@ uint8_t firstNibble = 0;
 bool lastRs = false;
 uint32_t lastBusTime = 0;
 
-// После потерянного/сомнительного импульса нельзя просто принять следующий
-// nibble: он может оказаться младшей половиной байта. Ждём смену RS — на
-// границе command/data первая половина снова однозначно старшая.
-bool decoderNeedsRsBoundary = true;
-bool observedRsValid = false;
-bool observedRs = false;
-
 // ============================================================================
 // ВНУТРЕННИЕ СЧЁТЧИКИ ЗАХВАТА
 // ============================================================================
@@ -140,7 +133,7 @@ volatile uint32_t rejectedDataCounter = 0;
 volatile uint32_t timeoutCounter = 0;
 volatile uint32_t rsResetCounter = 0;
 volatile uint32_t sampleDifferenceCounter = 0;
-volatile uint32_t decoderResyncCounter = 0;
+volatile uint32_t captureResetCounter = 0;
 
 // ============================================================================
 // ОСНОВНАЯ WEB-СТРАНИЦА
@@ -1419,34 +1412,6 @@ static inline void processCapturedNibble(
     bool currentRs,
     uint32_t now
 ) {
-    if (decoderNeedsRsBoundary) {
-        if (!observedRsValid) {
-            observedRs = currentRs;
-            observedRsValid = true;
-            lastBusTime = now;
-            return;
-        }
-
-        if (currentRs == observedRs) {
-            lastBusTime = now;
-            return;
-        }
-
-        // Смена RS сама является надёжной границей байта. Текущий nibble —
-        // первая (старшая) половина первого байта нового участка.
-        decoderNeedsRsBoundary = false;
-        observedRs = currentRs;
-        lastRs = currentRs;
-        lastBusTime = now;
-        firstNibble = nibble;
-        stage = 1;
-        decoderResyncCounter++;
-        return;
-    }
-
-    observedRs = currentRs;
-    observedRsValid = true;
-
     if (
         lastBusTime != 0 &&
         (uint32_t)(now - lastBusTime) > NIBBLE_TIMEOUT_US
@@ -1478,19 +1443,6 @@ static inline void processCapturedNibble(
 
     stage = 0;
     processByte(value, currentRs, now);
-}
-
-static inline void markDecoderDesynchronized(
-    bool rsKnown,
-    bool currentRs
-) {
-    stage = 0;
-    firstNibble = 0;
-    lcdAddressSpace = LCD_SPACE_NONE;
-    cgramCandidateActive = false;
-    decoderNeedsRsBoundary = true;
-    observedRsValid = rsKnown;
-    observedRs = currentRs;
 }
 
 // ============================================================================
@@ -1546,9 +1498,6 @@ static inline void serviceLcdCaptureReset()
         return;
     }
 
-    bool hadStableBusState = lastBusTime != 0;
-    bool previousRs = lastRs;
-
     stage = 0;
     firstNibble = 0;
     lastBusTime = 0;
@@ -1561,12 +1510,8 @@ static inline void serviceLcdCaptureReset()
     cgramCandidateActive = false;
     cgramCandidateLastUs = 0;
 
-    decoderNeedsRsBoundary = true;
-    observedRsValid = hadStableBusState;
-    observedRs = previousRs;
-
     lcdPushForceInitial = true;
-    decoderResyncCounter++;
+    captureResetCounter++;
 
     if (flags & LCD_RESET_SEND_ACK) {
         lcdResetAckPending = true;
@@ -1911,7 +1856,7 @@ void setup()
     });
 
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-        char statusJson[320];
+        char statusJson[640];
 
         snprintf(
             statusJson,
@@ -1921,13 +1866,33 @@ void setup()
             "\"lcd_version\":%lu,"
             "\"pulses\":%lu,"
             "\"sample_mismatch\":%lu,"
-            "\"decoder_resync\":%lu}",
+            "\"bytes\":%lu,"
+            "\"address_commands\":%lu,"
+            "\"accepted_data\":%lu,"
+            "\"rejected_data\":%lu,"
+            "\"ignored_commands\":%lu,"
+            "\"nibble_timeouts\":%lu,"
+            "\"rs_resets\":%lu,"
+            "\"capture_resets\":%lu,"
+            "\"stage\":%u,"
+            "\"address_space\":%u,"
+            "\"address\":%u}",
             FIRMWARE_VERSION,
             (unsigned long)millis(),
             (unsigned long)lcdVersion,
             (unsigned long)pulseCounter,
             (unsigned long)sampleDifferenceCounter,
-            (unsigned long)decoderResyncCounter
+            (unsigned long)byteCounter,
+            (unsigned long)addressCounter,
+            (unsigned long)acceptedDataCounter,
+            (unsigned long)rejectedDataCounter,
+            (unsigned long)ignoredCommandCounter,
+            (unsigned long)timeoutCounter,
+            (unsigned long)rsResetCounter,
+            (unsigned long)captureResetCounter,
+            (unsigned int)stage,
+            (unsigned int)lcdAddressSpace,
+            (unsigned int)lcdAddress
         );
 
         AsyncWebServerResponse *response =
@@ -2071,9 +2036,9 @@ void setup()
     );
 
     Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
-    Serial.println("LCD capture: SAMPLE_DELAY=90, matching bus samples only");
+    Serial.println("LCD capture: SAMPLE_DELAY=90, capture=s1, s2 diagnostic only");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
-    Serial.println("Nibble sync: RS-boundary recovery + remote R reset");
+    Serial.println("Nibble sync: reset incomplete byte on timeout/RS change");
 }
 
 // ============================================================================
@@ -2112,27 +2077,14 @@ void loop()
 
         if (sampleChanged) {
             sampleDifferenceCounter++;
-
-            bool rsKnown =
-                ((s1 ^ s2) & MASK_RS) == 0;
-
-            bool sampledRs =
-                (s2 & MASK_RS) != 0;
-
-            // Сомнительный nibble никогда не попадает в декодер.
-            markDecoderDesynchronized(
-                rsKnown,
-                sampledRs
-            );
-            return;
         }
 
-        // Уровень E здесь намеренно не проверяется. На реальном MFJ его
-        // короткий импульс может закончиться к моменту SAMPLE_DELAY, тогда
-        // как RS/D4..D7 ещё стабильны по времени удержания. Требование E=1
-        // отбрасывало почти все корректные передачи и оставляло Web LCD
-        // пустым. Достоверность определяет совпадение двух чтений шины.
-        uint32_t reg = s2;
+        // Это точная схема доказанного терминального захвата: s1 сделан в
+        // проверенной точке SAMPLE_DELAY и всегда сохраняет место nibble в
+        // потоке. s2 нужен только для статистики. Отбрасывание несовпавшей
+        // пары удаляло один nibble, сдвигало сборку байтов и теряло весь
+        // следующий блок экрана.
+        uint32_t reg = s1;
 
         bool currentRs = (reg & MASK_RS) != 0;
         uint8_t nibble = readNibble(reg);
