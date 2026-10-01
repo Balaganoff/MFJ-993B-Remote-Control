@@ -4,10 +4,18 @@ const path = require('node:path');
 const {spawnSync} = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const source = fs.readFileSync(path.join(
+const repositoryFirmware = path.join(
+  root,
+  'firmware/MFJ993B_Remote_Control/MFJ993B_Remote_Control.ino'
+);
+const packageFirmware = path.join(
   root,
   'MFJ993B_Companion_Win64_v1.2.2/firmware_source/MFJ993B_Remote_Control.ino'
-), 'utf8');
+);
+const source = fs.readFileSync(
+  fs.existsSync(repositoryFirmware) ? repositoryFirmware : packageFirmware,
+  'utf8'
+);
 
 assert.doesNotMatch(
   source,
