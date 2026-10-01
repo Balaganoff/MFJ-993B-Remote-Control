@@ -10,7 +10,7 @@ const repositoryFirmware = path.join(
 );
 const packageFirmware = path.join(
   root,
-  'MFJ993B_Companion_Win64_v1.2.2/firmware_source/MFJ993B_Remote_Control.ino'
+  'MFJ993B_Companion_Win64_v1.2.3/firmware_source/MFJ993B_Remote_Control.ino'
 );
 const source = fs.readFileSync(
   fs.existsSync(repositoryFirmware) ? repositoryFirmware : packageFirmware,
@@ -21,6 +21,11 @@ assert.doesNotMatch(
   source,
   /sampleLate|lateSampleCounter/,
   'short valid E pulses must not be rejected after the delayed bus sample'
+);
+assert.match(
+  source,
+  /const uint32_t SAMPLE_DELAY = 110;/,
+  'the measured terminal capture point must remain at 110 CPU cycles'
 );
 assert.match(
   source,

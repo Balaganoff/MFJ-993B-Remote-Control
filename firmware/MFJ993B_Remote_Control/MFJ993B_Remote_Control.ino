@@ -34,13 +34,13 @@ const uint32_t MASK_LCD_BUS =
     MASK_DB6 |
     MASK_DB7;
 
-const uint32_t SAMPLE_DELAY = 90;
+const uint32_t SAMPLE_DELAY = 110;
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 const uint32_t DISPLAY_IDLE_US = 2000;
 
 const char FIRMWARE_VERSION[] =
-    "2026.10.01-lcd-resync-v1.2.2";
+    "2026.10.01-lcd-resync-v1.2.3";
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
@@ -2036,7 +2036,7 @@ void setup()
     );
 
     Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
-    Serial.println("LCD capture: SAMPLE_DELAY=90, capture=s1, s2 diagnostic only");
+    Serial.println("LCD capture: SAMPLE_DELAY=110, capture=s1, s2 diagnostic only");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
     Serial.println("Nibble sync: reset incomplete byte on timeout/RS change");
 }

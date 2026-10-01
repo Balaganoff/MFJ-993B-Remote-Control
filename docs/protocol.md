@@ -13,7 +13,7 @@ The browser normally renders the captured LCD directly. Only the recognized main
 The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency.
 
 1. Core 1 watches `GPIO_IN_REG` for LCD `E` high.
-2. After `SAMPLE_DELAY = 90` CPU cycles, the proven first RS/DB4-DB7 sample `s1` is captured; an immediate `s2` is retained only as a timing diagnostic.
+2. After `SAMPLE_DELAY = 110` CPU cycles, the proven first RS/DB4-DB7 sample `s1` is captured; an immediate `s2` is retained only as a timing diagnostic.
 3. `s1` always enters the nibble decoder. Rejecting an `s1`/`s2` disagreement removes a real nibble from this short-E bus and shifts every following byte in the current LCD block.
 4. `E` is intentionally not required to remain high at the delayed sample: RS/data remain valid during their hold time after the measured short pulse ends.
 5. A normal gap longer than 5000 µs or an RS change discards only an incomplete nibble pair. It does not erase the last accepted DDRAM/CGRAM address state.
@@ -21,7 +21,7 @@ The target is a classic dual-core ESP32 running at a fixed 240 MHz CPU frequency
 7. The visible DDRAM ranges are `0x00-0x0F` and `0x40-0x4F`.
 8. CGRAM stores eight custom 5x8 glyphs: 64 rows in total. A row update preserves the other seven rows exactly as the LCD controller does.
 
-The 90-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. On the measured installation `s1` is the validated sample; `s2` counts boundary movement but never removes the corresponding nibble. Requiring `E=1` or requiring `s1 == s2` at that point rejects valid pulses on this tuner.
+The 110-cycle point depends on the exact ESP32 model, fixed CPU clock, wiring, level shifter and tuner board. Changing any of them may require a new terminal capture test. On the measured installation `s1` is the validated sample; `s2` counts boundary movement but never removes the corresponding nibble. Requiring `E=1` or requiring `s1 == s2` at that point rejects valid pulses on this tuner.
 
 ## Snapshot readiness
 
@@ -91,7 +91,7 @@ Button order:
 
 ### ESP32 to browser
 
-On every WebSocket connection the firmware sends `FW:2026.10.01-lcd-resync-v1.2.2`, allowing remote clients to confirm the running image without a serial terminal.
+On every WebSocket connection the firmware sends `FW:2026.10.01-lcd-resync-v1.2.3`, allowing remote clients to confirm the running image without a serial terminal.
 
 #### LCD snapshot — 98 bytes
 

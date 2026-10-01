@@ -202,10 +202,10 @@ class ResetCaptureTests(unittest.TestCase):
         self.assertFalse(app.reset_waiting)
         self.assertEqual(app.root.cancelled, ["reset-job"])
 
-        app._handle_text_message("FW:2026.10.01-lcd-resync-v1.2.2")
+        app._handle_text_message("FW:2026.10.01-lcd-resync-v1.2.3")
         self.assertEqual(
             app.status_var.value,
-            "ESP32: 2026.10.01-lcd-resync-v1.2.2",
+            "ESP32: 2026.10.01-lcd-resync-v1.2.3",
         )
 
 

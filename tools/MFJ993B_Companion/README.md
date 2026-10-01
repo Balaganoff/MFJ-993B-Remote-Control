@@ -1,6 +1,6 @@
-# MFJ-993B Companion v1.2.2
+# MFJ-993B Companion v1.2.3
 
-Native Tkinter client for Windows x64. It uses the firmware WebSocket endpoint directly and does not embed a browser. Version 1.2.2 shows the firmware actually running on the remote ESP32 after every connection and OTA restart.
+Native Tkinter client for Windows x64. It uses the firmware WebSocket endpoint directly and does not embed a browser. Version 1.2.3 shows the firmware actually running on the remote ESP32 after every connection and OTA restart.
 
 ## Run from source
 

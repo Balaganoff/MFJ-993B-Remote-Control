@@ -2,6 +2,10 @@
 
 ## 2026-10-01
 
+- Version 1.2.3 restores the measured terminal timing exactly: `SAMPLE_DELAY = 110` CPU cycles.
+- The v1.2.2 status counters proved that the earlier 90-cycle point sampled RS low: command bytes increased while accepted data remained zero.
+- Added a regression assertion that prevents the validated 110-cycle capture point from changing silently again.
+
 - Version 1.2.2 restores the measured capture path: the first delayed sample `s1` drives the decoder and `s2` is diagnostic only.
 - An `s1`/`s2` disagreement no longer deletes a nibble, clears the LCD address state or locks the decoder until an RS transition.
 - Timeout, RS-change and manual reset recovery now discard only an incomplete byte; manual reset still never changes POWER or button GPIOs.
