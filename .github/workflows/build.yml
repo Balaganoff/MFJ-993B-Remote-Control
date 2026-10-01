@@ -9,9 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Test LCD decoder reset/resync
+        run: node tests/lcd-reset-host.test.cjs
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Test Windows companion logic
+        run: python -m unittest discover -s tools/MFJ993B_Companion/tests -v
       - name: Install PlatformIO
         run: pip install platformio
       - name: Build

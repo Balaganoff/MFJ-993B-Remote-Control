@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-01
+
+- Version 1.2.3 restores the measured terminal timing exactly: `SAMPLE_DELAY = 110` CPU cycles.
+- The v1.2.2 status counters proved that the earlier 90-cycle point sampled RS low: command bytes increased while accepted data remained zero.
+- Added a regression assertion that prevents the validated 110-cycle capture point from changing silently again.
+
+- Version 1.2.2 restores the measured capture path: the first delayed sample `s1` drives the decoder and `s2` is diagnostic only.
+- An `s1`/`s2` disagreement no longer deletes a nibble, clears the LCD address state or locks the decoder until an RS transition.
+- Timeout, RS-change and manual reset recovery now discard only an incomplete byte; manual reset still never changes POWER or button GPIOs.
+- `/status` now exposes byte, address-command, accepted/rejected-data, timeout, RS-reset and live decoder-state counters.
+- Added regression coverage for the proven first-sample path and non-destructive capture recovery.
+
+## 2026-09-30
+
+- Version 1.2.1: accept the measured short `E` pulse while still requiring both immediate RS/DB4-DB7 reads to agree; this fixes the blank browser LCD introduced by the over-strict `E` gate.
+- Added `GET /status` and a WebSocket `FW:<version>` greeting for remote post-OTA verification.
+- Reject LCD samples unless both immediate RS/DB4-DB7 reads agree.
+- Recover nibble phase only at an unambiguous RS command/data boundary after a rejected pulse.
+- Added WebSocket command `R` for a capture-only reset and `LCD_RESET_OK` acknowledgement.
+- The capture reset never changes button GPIOs or tuner power and preserves CGRAM during a manual reset.
+- Added host regression coverage for reset, CGRAM preservation, power-mask preservation and RS-boundary recovery.
+
 ## 2026-09-11
 
 - Replaced Arduino IDE network-port update mode with browser upload at `/update`.

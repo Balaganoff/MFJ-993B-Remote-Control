@@ -34,10 +34,13 @@ const uint32_t MASK_LCD_BUS =
     MASK_DB6 |
     MASK_DB7;
 
-const uint32_t SAMPLE_DELAY = 90;
+const uint32_t SAMPLE_DELAY = 110;
 const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 const uint32_t DISPLAY_IDLE_US = 2000;
+
+const char FIRMWARE_VERSION[] =
+    "2026.10.01-lcd-resync-v1.2.3";
 
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
@@ -99,6 +102,15 @@ uint32_t lcdPushLastVersion = 0;
 bool cgramCandidateActive = false;
 uint32_t cgramCandidateLastUs = 0;
 
+// Запрос сброса приходит с сетевого ядра, а исполняется только ядром
+// захвата. Это не трогает GPIO кнопок и питание тюнера.
+const uint8_t LCD_RESET_CLEAR_DDRAM = 0x01;
+const uint8_t LCD_RESET_CLEAR_CGRAM = 0x02;
+const uint8_t LCD_RESET_SEND_ACK    = 0x80;
+
+volatile uint8_t lcdResetRequestFlags = 0;
+volatile bool lcdResetAckPending = false;
+
 // ============================================================================
 // СБОРКА БАЙТА
 // ============================================================================
@@ -121,6 +133,7 @@ volatile uint32_t rejectedDataCounter = 0;
 volatile uint32_t timeoutCounter = 0;
 volatile uint32_t rsResetCounter = 0;
 volatile uint32_t sampleDifferenceCounter = 0;
+volatile uint32_t captureResetCounter = 0;
 
 // ============================================================================
 // ОСНОВНАЯ WEB-СТРАНИЦА
@@ -1436,21 +1449,57 @@ static inline void processCapturedNibble(
 // КНОПКИ
 // ============================================================================
 
-void clearCapturedLcdBeforePowerOn()
+void requestLcdCaptureReset(
+    bool clearCgram,
+    bool sendAck
+)
 {
     portENTER_CRITICAL(&lcdMux);
 
-    memset(lcdScreen, ' ', sizeof(lcdScreen));
-    memset(lcdCgram, 0, sizeof(lcdCgram));
-    memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
-    lcdVersion++;
-    lastDdramChangeUs = micros();
+    lcdResetRequestFlags |= LCD_RESET_CLEAR_DDRAM;
+
+    if (clearCgram) {
+        lcdResetRequestFlags |= LCD_RESET_CLEAR_CGRAM;
+    }
+
+    if (sendAck) {
+        lcdResetRequestFlags |= LCD_RESET_SEND_ACK;
+    }
+
+    portEXIT_CRITICAL(&lcdMux);
+}
+
+static inline void serviceLcdCaptureReset()
+{
+    uint8_t flags = 0;
+
+    portENTER_CRITICAL(&lcdMux);
+
+    flags = lcdResetRequestFlags;
+    lcdResetRequestFlags = 0;
+
+    if (flags != 0) {
+        memset(lcdScreen, ' ', sizeof(lcdScreen));
+
+        // При ручной ресинхронизации CGRAM сохраняем: PIC обычно загружает
+        // пользовательские символы только при старте и может их не повторить.
+        if (flags & LCD_RESET_CLEAR_CGRAM) {
+            memset(lcdCgram, 0, sizeof(lcdCgram));
+            memset(lcdCgramKnownRows, 0, sizeof(lcdCgramKnownRows));
+        }
+
+        lcdVersion++;
+        lastDdramChangeUs = micros();
+    }
 
     portEXIT_CRITICAL(&lcdMux);
 
+    if (flags == 0) {
+        return;
+    }
+
     stage = 0;
     firstNibble = 0;
-    lastRs = false;
     lastBusTime = 0;
 
     lcdAddress = 0;
@@ -1460,6 +1509,13 @@ void clearCapturedLcdBeforePowerOn()
 
     cgramCandidateActive = false;
     cgramCandidateLastUs = 0;
+
+    lcdPushForceInitial = true;
+    captureResetCounter++;
+
+    if (flags & LCD_RESET_SEND_ACK) {
+        lcdResetAckPending = true;
+    }
 }
 
 void applyButtonMask(uint16_t newMask)
@@ -1473,7 +1529,9 @@ void applyButtonMask(uint16_t newMask)
         (newMask & (1U << 8)) != 0;
 
     if (!powerWasOn && powerWillBeOn) {
-        clearCapturedLcdBeforePowerOn();
+        // Полный сброс здесь нужен только потому, что после настоящего
+        // включения PIC заново загрузит и DDRAM, и CGRAM.
+        requestLcdCaptureReset(true, false);
     }
 
     for (uint8_t i = 0; i < 9; i++) {
@@ -1572,6 +1630,15 @@ void handleWebSocketEvent(
 ) {
     if (type == WS_EVT_CONNECT) {
         lcdPushForceInitial = true;
+
+        char firmwareHello[64];
+        snprintf(
+            firmwareHello,
+            sizeof(firmwareHello),
+            "FW:%s",
+            FIRMWARE_VERSION
+        );
+        client->text(firmwareHello);
         return;
     }
 
@@ -1614,6 +1681,17 @@ void handleWebSocketEvent(
         }
 
         applyButtonMask(newMask);
+        return;
+    }
+
+    // Безопасный сброс только программной копии и автомата декодера.
+    // Ни один GPIO кнопок, включая POWER, здесь не изменяется.
+    if (
+        length == 1 &&
+        data[0] == 'R' &&
+        !webUpdateInProgress
+    ) {
+        requestLcdCaptureReset(false, true);
     }
 }
 
@@ -1647,6 +1725,11 @@ void TaskWeb(void *parameter)
 
         if (!webUpdateInProgress && !webUpdateRestartPending) {
             pushLcdSnapshotIfReady();
+        }
+
+        if (lcdResetAckPending) {
+            lcdResetAckPending = false;
+            ws.textAll("LCD_RESET_OK");
         }
 
         if ((uint32_t)(now - lastCleanupMs) >= 5000) {
@@ -1770,6 +1853,60 @@ void setup()
 
         delay(300);
         ESP.restart();
+    });
+
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        char statusJson[640];
+
+        snprintf(
+            statusJson,
+            sizeof(statusJson),
+            "{\"firmware\":\"%s\","
+            "\"uptime_ms\":%lu,"
+            "\"lcd_version\":%lu,"
+            "\"pulses\":%lu,"
+            "\"sample_mismatch\":%lu,"
+            "\"bytes\":%lu,"
+            "\"address_commands\":%lu,"
+            "\"accepted_data\":%lu,"
+            "\"rejected_data\":%lu,"
+            "\"ignored_commands\":%lu,"
+            "\"nibble_timeouts\":%lu,"
+            "\"rs_resets\":%lu,"
+            "\"capture_resets\":%lu,"
+            "\"stage\":%u,"
+            "\"address_space\":%u,"
+            "\"address\":%u}",
+            FIRMWARE_VERSION,
+            (unsigned long)millis(),
+            (unsigned long)lcdVersion,
+            (unsigned long)pulseCounter,
+            (unsigned long)sampleDifferenceCounter,
+            (unsigned long)byteCounter,
+            (unsigned long)addressCounter,
+            (unsigned long)acceptedDataCounter,
+            (unsigned long)rejectedDataCounter,
+            (unsigned long)ignoredCommandCounter,
+            (unsigned long)timeoutCounter,
+            (unsigned long)rsResetCounter,
+            (unsigned long)captureResetCounter,
+            (unsigned int)stage,
+            (unsigned int)lcdAddressSpace,
+            (unsigned int)lcdAddress
+        );
+
+        AsyncWebServerResponse *response =
+            request->beginResponse(
+                200,
+                "application/json; charset=utf-8",
+                statusJson
+            );
+
+        response->addHeader(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        );
+        request->send(response);
     });
 
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1898,9 +2035,10 @@ void setup()
         0
     );
 
-    Serial.println("LCD capture: SAMPLE_DELAY=90, capture=s1");
+    Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.println("LCD capture: SAMPLE_DELAY=110, capture=s1, s2 diagnostic only");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
-    Serial.println("Nibble sync: reset incomplete byte only");
+    Serial.println("Nibble sync: reset incomplete byte on timeout/RS change");
 }
 
 // ============================================================================
@@ -1909,6 +2047,8 @@ void setup()
 
 void loop()
 {
+    serviceLcdCaptureReset();
+
     if (webUpdateInProgress || webUpdateRestartPending) {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -1926,20 +2066,25 @@ void loop()
         uint32_t s1 = REG_READ(GPIO_IN_REG);
         uint32_t s2 = REG_READ(GPIO_IN_REG);
 
-        uint32_t reg = s1;
-
         while (REG_READ(GPIO_IN_REG) & MASK_E) {
             // Один импульс E обрабатывается ровно один раз.
         }
 
         pulseCounter++;
 
-        bool sampleUnstable =
+        bool sampleChanged =
             ((s1 ^ s2) & MASK_LCD_BUS) != 0;
 
-        if (sampleUnstable) {
+        if (sampleChanged) {
             sampleDifferenceCounter++;
         }
+
+        // Это точная схема доказанного терминального захвата: s1 сделан в
+        // проверенной точке SAMPLE_DELAY и всегда сохраняет место nibble в
+        // потоке. s2 нужен только для статистики. Отбрасывание несовпавшей
+        // пары удаляло один nibble, сдвигало сборку байтов и теряло весь
+        // следующий блок экрана.
+        uint32_t reg = s1;
 
         bool currentRs = (reg & MASK_RS) != 0;
         uint8_t nibble = readNibble(reg);
