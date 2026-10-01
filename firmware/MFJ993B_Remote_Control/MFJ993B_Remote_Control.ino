@@ -39,6 +39,9 @@ const uint32_t NIBBLE_TIMEOUT_US = 5000;
 const uint32_t CGRAM_BLOCK_TIMEOUT_US = 10000;
 const uint32_t DISPLAY_IDLE_US = 2000;
 
+const char FIRMWARE_VERSION[] =
+    "2026.10.01-main-capture-recovery-v1";
+
 // Биты 1, 2, 4, 5, 6 и 7 — кнопки без фиксации.
 const uint16_t MOMENTARY_BUTTON_MASK =
     (1U << 1) |
@@ -99,11 +102,35 @@ uint32_t lcdPushLastVersion = 0;
 bool cgramCandidateActive = false;
 uint32_t cgramCandidateLastUs = 0;
 
+// Перед каждым непрерывным участком с одним значением RS сохраняется ровно
+// то состояние, которое уже было подтверждено полными парами полубайтов.
+// Если на границе RS или после длинной паузы остаётся одинокий nibble,
+// участок имел нечётное число импульсов E: его изменения откатываются.
+// Штатный чётный участок только подтверждает checkpoint и идёт тем же путём,
+// что и в исходной прошивке.
+struct LcdRunCheckpoint {
+    bool active;
+    uint8_t screen[32];
+    uint8_t cgram[8][8];
+    uint8_t cgramKnownRows[8];
+    bool increment;
+};
+
+LcdRunCheckpoint lcdRunCheckpoint = {};
+
+volatile bool lcdRecoveryRequested = false;
+volatile bool lcdRecoveryAckPending = false;
+volatile bool lcdRecoveryWaitingBoundary = false;
+bool lcdRecoveryObservedRs = false;
+
+volatile uint32_t lcdRollbackCounter = 0;
+volatile uint32_t lcdManualRecoveryCounter = 0;
+
 // ============================================================================
 // СБОРКА БАЙТА
 // ============================================================================
 
-uint8_t stage = 0;
+volatile uint8_t stage = 0;
 uint8_t firstNibble = 0;
 bool lastRs = false;
 uint32_t lastBusTime = 0;
@@ -1241,6 +1268,101 @@ static inline void advanceDdramAddress()
     }
 }
 
+static inline void beginLcdRunCheckpoint()
+{
+    portENTER_CRITICAL(&lcdMux);
+
+    memcpy(
+        lcdRunCheckpoint.screen,
+        lcdScreen,
+        sizeof(lcdScreen)
+    );
+    memcpy(
+        lcdRunCheckpoint.cgram,
+        lcdCgram,
+        sizeof(lcdCgram)
+    );
+    memcpy(
+        lcdRunCheckpoint.cgramKnownRows,
+        lcdCgramKnownRows,
+        sizeof(lcdCgramKnownRows)
+    );
+
+    portEXIT_CRITICAL(&lcdMux);
+
+    lcdRunCheckpoint.increment = entryIncrement;
+    lcdRunCheckpoint.active = true;
+}
+
+static inline void commitLcdRunCheckpoint()
+{
+    lcdRunCheckpoint.active = false;
+}
+
+static inline void rollbackLcdRunCheckpoint(uint32_t now)
+{
+    if (!lcdRunCheckpoint.active) {
+        return;
+    }
+
+    portENTER_CRITICAL(&lcdMux);
+
+    bool screenChanged =
+        memcmp(
+            lcdScreen,
+            lcdRunCheckpoint.screen,
+            sizeof(lcdScreen)
+        ) != 0;
+
+    bool cgramChanged =
+        memcmp(
+            lcdCgram,
+            lcdRunCheckpoint.cgram,
+            sizeof(lcdCgram)
+        ) != 0 ||
+        memcmp(
+            lcdCgramKnownRows,
+            lcdRunCheckpoint.cgramKnownRows,
+            sizeof(lcdCgramKnownRows)
+        ) != 0;
+
+    memcpy(
+        lcdScreen,
+        lcdRunCheckpoint.screen,
+        sizeof(lcdScreen)
+    );
+    memcpy(
+        lcdCgram,
+        lcdRunCheckpoint.cgram,
+        sizeof(lcdCgram)
+    );
+    memcpy(
+        lcdCgramKnownRows,
+        lcdRunCheckpoint.cgramKnownRows,
+        sizeof(lcdCgramKnownRows)
+    );
+
+    if (screenChanged || cgramChanged) {
+        lcdVersion++;
+    }
+
+    if (screenChanged) {
+        lastDdramChangeUs = now;
+    }
+
+    portEXIT_CRITICAL(&lcdMux);
+
+    entryIncrement = lcdRunCheckpoint.increment;
+    // После нечётного участка физический address counter уже нельзя вывести
+    // из принятого потока. Содержимое возвращено, но новые DATA принимаются
+    // только после следующего настоящего Set DDRAM/CGRAM Address.
+    lcdAddressSpace = LCD_SPACE_NONE;
+    cgramCandidateActive = false;
+
+    lcdRunCheckpoint.active = false;
+    lcdRollbackCounter++;
+}
+
 void processCommand(uint8_t command, uint32_t now)
 {
     if (command == 0x01) {
@@ -1399,12 +1521,71 @@ static inline void processCapturedNibble(
     bool currentRs,
     uint32_t now
 ) {
+    // Ручной RECOVER не очищает экран и не меняет GPIO кнопок. Он отбрасывает
+    // только текущий незавершённый участок и ждёт надёжную границу: смену RS
+    // либо паузу длиннее NIBBLE_TIMEOUT_US.
+    if (
+        __atomic_exchange_n(
+            &lcdRecoveryRequested,
+            false,
+            __ATOMIC_ACQ_REL
+        )
+    ) {
+        rollbackLcdRunCheckpoint(now);
+
+        stage = 0;
+        firstNibble = 0;
+        lcdAddressSpace = LCD_SPACE_NONE;
+        cgramCandidateActive = false;
+
+        lcdRecoveryWaitingBoundary = true;
+        lcdRecoveryObservedRs = currentRs;
+        lastRs = currentRs;
+        lastBusTime = now;
+        lcdManualRecoveryCounter++;
+        return;
+    }
+
+    if (lcdRecoveryWaitingBoundary) {
+        bool timeoutBoundary =
+            lastBusTime != 0 &&
+            (uint32_t)(now - lastBusTime) > NIBBLE_TIMEOUT_US;
+
+        bool rsBoundary =
+            currentRs != lcdRecoveryObservedRs;
+
+        lastBusTime = now;
+
+        if (!timeoutBoundary && !rsBoundary) {
+            return;
+        }
+
+        lcdRecoveryWaitingBoundary = false;
+        lcdRecoveryObservedRs = currentRs;
+        lastRs = currentRs;
+
+        beginLcdRunCheckpoint();
+        firstNibble = nibble;
+        stage = 1;
+
+        __atomic_store_n(
+            &lcdRecoveryAckPending,
+            true,
+            __ATOMIC_RELEASE
+        );
+        return;
+    }
+
     if (
         lastBusTime != 0 &&
         (uint32_t)(now - lastBusTime) > NIBBLE_TIMEOUT_US
     ) {
         if (stage != 0) {
             timeoutCounter++;
+            rollbackLcdRunCheckpoint(now);
+        }
+        else {
+            commitLcdRunCheckpoint();
         }
         stage = 0;
     }
@@ -1412,8 +1593,16 @@ static inline void processCapturedNibble(
     if (currentRs != lastRs) {
         if (stage != 0) {
             rsResetCounter++;
+            rollbackLcdRunCheckpoint(now);
+        }
+        else {
+            commitLcdRunCheckpoint();
         }
         stage = 0;
+    }
+
+    if (!lcdRunCheckpoint.active) {
+        beginLcdRunCheckpoint();
     }
 
     lastRs = currentRs;
@@ -1460,6 +1649,14 @@ void clearCapturedLcdBeforePowerOn()
 
     cgramCandidateActive = false;
     cgramCandidateLastUs = 0;
+
+    lcdRunCheckpoint.active = false;
+    lcdRecoveryWaitingBoundary = false;
+    __atomic_store_n(
+        &lcdRecoveryRequested,
+        false,
+        __ATOMIC_RELEASE
+    );
 }
 
 void applyButtonMask(uint16_t newMask)
@@ -1507,6 +1704,13 @@ void releaseMomentaryButtons()
 void pushLcdSnapshotIfReady()
 {
     if (ws.count() == 0) {
+        return;
+    }
+
+    // Не публикуем участок, который ещё не завершился полной парой nibble.
+    // При редкой потере импульса клиент продолжает видеть последний хороший
+    // кадр до автоматического rollback на следующей границе.
+    if (stage != 0 || lcdRecoveryWaitingBoundary) {
         return;
     }
 
@@ -1572,6 +1776,15 @@ void handleWebSocketEvent(
 ) {
     if (type == WS_EVT_CONNECT) {
         lcdPushForceInitial = true;
+
+        char firmwareHello[80];
+        snprintf(
+            firmwareHello,
+            sizeof(firmwareHello),
+            "FW:%s",
+            FIRMWARE_VERSION
+        );
+        client->text(firmwareHello);
         return;
     }
 
@@ -1614,6 +1827,22 @@ void handleWebSocketEvent(
         }
 
         applyButtonMask(newMask);
+        return;
+    }
+
+    if (
+        length == 1 &&
+        data[0] == 'R' &&
+        !webUpdateInProgress
+    ) {
+        // Только программный автомат захвата. Кнопочные GPIO и POWER здесь
+        // принципиально не вызываются и не изменяются.
+        __atomic_store_n(
+            &lcdRecoveryRequested,
+            true,
+            __ATOMIC_RELEASE
+        );
+        client->text("LCD_RECOVERY_ARMED");
     }
 }
 
@@ -1647,6 +1876,16 @@ void TaskWeb(void *parameter)
 
         if (!webUpdateInProgress && !webUpdateRestartPending) {
             pushLcdSnapshotIfReady();
+        }
+
+        if (
+            __atomic_exchange_n(
+                &lcdRecoveryAckPending,
+                false,
+                __ATOMIC_ACQ_REL
+            )
+        ) {
+            ws.textAll("LCD_RECOVERY_OK");
         }
 
         if ((uint32_t)(now - lastCleanupMs) >= 5000) {
@@ -1770,6 +2009,64 @@ void setup()
 
         delay(300);
         ESP.restart();
+    });
+
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        char statusJson[768];
+
+        snprintf(
+            statusJson,
+            sizeof(statusJson),
+            "{\"firmware\":\"%s\","
+            "\"uptime_ms\":%lu,"
+            "\"lcd_version\":%lu,"
+            "\"pulses\":%lu,"
+            "\"sample_mismatch\":%lu,"
+            "\"bytes\":%lu,"
+            "\"address_commands\":%lu,"
+            "\"accepted_data\":%lu,"
+            "\"rejected_data\":%lu,"
+            "\"ignored_commands\":%lu,"
+            "\"nibble_timeouts\":%lu,"
+            "\"rs_resets\":%lu,"
+            "\"run_rollbacks\":%lu,"
+            "\"manual_recoveries\":%lu,"
+            "\"recovery_waiting\":%s,"
+            "\"stage\":%u,"
+            "\"address_space\":%u,"
+            "\"address\":%u}",
+            FIRMWARE_VERSION,
+            (unsigned long)millis(),
+            (unsigned long)lcdVersion,
+            (unsigned long)pulseCounter,
+            (unsigned long)sampleDifferenceCounter,
+            (unsigned long)byteCounter,
+            (unsigned long)addressCounter,
+            (unsigned long)acceptedDataCounter,
+            (unsigned long)rejectedDataCounter,
+            (unsigned long)ignoredCommandCounter,
+            (unsigned long)timeoutCounter,
+            (unsigned long)rsResetCounter,
+            (unsigned long)lcdRollbackCounter,
+            (unsigned long)lcdManualRecoveryCounter,
+            lcdRecoveryWaitingBoundary ? "true" : "false",
+            (unsigned int)stage,
+            (unsigned int)lcdAddressSpace,
+            (unsigned int)lcdAddress
+        );
+
+        AsyncWebServerResponse *response =
+            request->beginResponse(
+                200,
+                "application/json; charset=utf-8",
+                statusJson
+            );
+
+        response->addHeader(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate, max-age=0"
+        );
+        request->send(response);
     });
 
     server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1898,9 +2195,10 @@ void setup()
         0
     );
 
+    Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
     Serial.println("LCD capture: SAMPLE_DELAY=90, capture=s1");
     Serial.println("Web LCD: push, форматирование только для FWD/REF");
-    Serial.println("Nibble sync: reset incomplete byte only");
+    Serial.println("Nibble sync: rollback odd RS run + optional R recovery");
 }
 
 // ============================================================================
